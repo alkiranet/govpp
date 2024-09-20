@@ -27,8 +27,8 @@ import (
 	"github.com/alkiranet/govpp"
 	"github.com/alkiranet/govpp/adapter/socketclient"
 	"github.com/alkiranet/govpp/api"
-	"github.com/alkiranet/govpp/examples/binapi/interfaces"
-	"github.com/alkiranet/govpp/examples/binapi/vpe"
+	interfaces "github.com/alkiranet/govpp/binapi/interface"
+	"github.com/alkiranet/govpp/binapi/vpe"
 )
 
 var (
@@ -47,20 +47,13 @@ func main() {
 	}
 	defer conn.Disconnect()
 
-	// create a channel
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		log.Fatalln("ERROR: creating channel failed:", err)
-	}
-	defer ch.Close()
-
-	showVersion(ch)
-	interfaceDump(ch)
+	showVersion(conn)
+	interfaceDump(conn)
 }
 
 // showVersion shows an example of simple request with services.
-func showVersion(ch api.Channel) {
-	c := vpe.NewServiceClient(ch)
+func showVersion(conn api.Connection) {
+	c := vpe.NewServiceClient(conn)
 
 	version, err := c.ShowVersion(context.Background(), &vpe.ShowVersion{})
 	if err != nil {
@@ -71,10 +64,10 @@ func showVersion(ch api.Channel) {
 }
 
 // interfaceDump shows an example of multi request with services.
-func interfaceDump(ch api.Channel) {
-	c := interfaces.NewServiceClient(ch)
+func interfaceDump(conn api.Connection) {
+	c := interfaces.NewServiceClient(conn)
 
-	stream, err := c.DumpSwInterface(context.Background(), &interfaces.SwInterfaceDump{})
+	stream, err := c.SwInterfaceDump(context.Background(), &interfaces.SwInterfaceDump{})
 	if err != nil {
 		log.Fatalln("ERROR: DumpSwInterface failed:", err)
 	}

@@ -52,9 +52,9 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/alkiranet/govpp/extras/libmemif"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/alkiranet/govpp/extras/libmemif"
 )
 
 var (
@@ -338,6 +338,7 @@ func main() {
 			Secret:         "secret",                // Secret used to authenticate the memif connection.
 			IsMaster:       isMaster,
 			Mode:           libmemif.IfModeEthernet,
+			AppName:        appName,
 		},
 		MemifShmSpecs: libmemif.MemifShmSpecs{
 			NumRxQueues:  3, // NumQueues is the (configured!) number of queues for both Rx & Tx.

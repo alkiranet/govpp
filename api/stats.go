@@ -21,6 +21,7 @@ type StatsProvider interface {
 	GetInterfaceStats(*InterfaceStats) error
 	GetErrorStats(*ErrorStats) error
 	GetBufferStats(*BufferStats) error
+	GetMemoryStats(*MemoryStats) error
 }
 
 // SystemStats represents global system statistics.
@@ -97,7 +98,7 @@ type ErrorStats struct {
 type ErrorCounter struct {
 	CounterName string
 
-	Value uint64
+	Values []uint64
 }
 
 // BufferStats represents statistics per buffer pool.
@@ -112,4 +113,27 @@ type BufferPool struct {
 	Cached    float64
 	Used      float64
 	Available float64
+}
+
+// MemoryStats represents memory stats segment counters.
+type MemoryStats struct {
+	// Deprecated: /mem/statseg total memory directory
+	Total float64
+	// Deprecated: /mem/statseg used memory directory
+	Used float64
+
+	// stat/main memory usage per-heap
+	Stat map[int]MemoryCounters
+	Main map[int]MemoryCounters
+}
+
+// MemoryCounters represents values of various memory usage
+type MemoryCounters struct {
+	Total      uint64
+	Used       uint64
+	Free       uint64
+	UsedMMap   uint64
+	TotalAlloc uint64
+	FreeChunks uint64
+	Releasable uint64
 }

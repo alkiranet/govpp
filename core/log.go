@@ -2,32 +2,73 @@ package core
 
 import (
 	"os"
+	"strings"
 
-	logger "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	DebugEnvVar = "DEBUG_GOVPP"
+
+	debugOptMsgId    = "msgid"
+	debugOptChannels = "channels"
 )
 
 var (
-	debug       = os.Getenv("DEBUG_GOVPP") != ""
-	debugMsgIDs = os.Getenv("DEBUG_GOVPP_MSGIDS") != ""
+	debugOn  = os.Getenv(DebugEnvVar) != ""
+	debugMap = initDebugMap(os.Getenv(DebugEnvVar))
 
-	log = logger.New() // global logger
+	log = logrus.New()
 )
 
-// init initializes global logger, which logs debug level messages to stdout.
+// init initializes global logger
 func init() {
-	log.Out = os.Stdout
-	if debug {
-		log.Level = logger.DebugLevel
-		log.Debugf("govpp/core: debug mode enabled")
+	log.Formatter = &logrus.TextFormatter{
+		EnvironmentOverrideColors: true,
+	}
+	if debugOn {
+		log.Level = logrus.DebugLevel
+		log.Debugf("govpp: debug enabled %+v", debugMap)
 	}
 }
 
+func isDebugOn(u string) bool {
+	_, ok := debugMap[u]
+	return ok
+}
+
+func initDebugMap(s string) map[string]string {
+	debugMap := make(map[string]string)
+	for _, p := range splitString(s) {
+		var key, val string
+		kv := strings.SplitN(p, "=", 2)
+		key = kv[0]
+		if len(kv) > 1 {
+			val = kv[1]
+		} else {
+			val = "true"
+		}
+		debugMap[key] = val
+	}
+	return debugMap
+}
+
+func splitString(s string) []string {
+	return strings.FieldsFunc(s, func(c rune) bool {
+		switch c {
+		case ';', ',', ' ':
+			return true
+		}
+		return false
+	})
+}
+
 // SetLogger sets global logger to l.
-func SetLogger(l *logger.Logger) {
+func SetLogger(l *logrus.Logger) {
 	log = l
 }
 
 // SetLogLevel sets global logger level to lvl.
-func SetLogLevel(lvl logger.Level) {
+func SetLogLevel(lvl logrus.Level) {
 	log.Level = lvl
 }

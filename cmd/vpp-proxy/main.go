@@ -15,18 +15,17 @@
 package main
 
 import (
-	"context"
 	"encoding/gob"
 	"flag"
-	"io"
 	"log"
 
 	"github.com/alkiranet/govpp/adapter/socketclient"
 	"github.com/alkiranet/govpp/adapter/statsclient"
 	"github.com/alkiranet/govpp/api"
+	interfaces "github.com/alkiranet/govpp/binapi/interface"
+	"github.com/alkiranet/govpp/binapi/vlib"
+	"github.com/alkiranet/govpp/binapi/vpe"
 	_ "github.com/alkiranet/govpp/core"
-	"github.com/alkiranet/govpp/examples/binapi/interfaces"
-	"github.com/alkiranet/govpp/examples/binapi/vpe"
 	"github.com/alkiranet/govpp/proxy"
 )
 
@@ -37,8 +36,10 @@ var (
 )
 
 func init() {
-	for _, msg := range api.GetRegisteredMessages() {
-		gob.Register(msg)
+	for _, msgList := range api.GetRegisteredMessages() {
+		for _, msg := range msgList {
+			gob.Register(msg)
+		}
 	}
 }
 
@@ -93,30 +94,12 @@ func runClient() {
 		panic(err)
 	}
 
-	// - using binapi message directly
-	req := &vpe.CliInband{Cmd: "show version"}
-	reply := new(vpe.CliInbandReply)
+	req := &vlib.CliInband{Cmd: "show version"}
+	reply := new(vlib.CliInbandReply)
 	if err := binapiChannel.SendRequest(req).ReceiveReply(reply); err != nil {
 		log.Fatalln("binapi request failed:", err)
 	}
 	log.Printf("VPP version: %+v", reply.Reply)
-
-	// - or using generated rpc service
-	svc := interfaces.NewServiceClient(binapiChannel)
-	stream, err := svc.DumpSwInterface(context.Background(), &interfaces.SwInterfaceDump{})
-	if err != nil {
-		log.Fatalln("binapi request failed:", err)
-	}
-	for {
-		iface, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.Printf("- interface: %+v", iface)
-	}
 }
 
 func runServer() {

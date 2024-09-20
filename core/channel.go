@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -37,14 +38,18 @@ type MessageCodec interface {
 	EncodeMsg(msg api.Message, msgID uint16) ([]byte, error)
 	// DecodeMsg decodes binary-encoded data of a message into provided Message structure.
 	DecodeMsg(data []byte, msg api.Message) error
+	// DecodeMsgContext decodes context from message data and type.
+	DecodeMsgContext(data []byte, msgType api.MessageType) (context uint32, err error)
 }
 
 // MessageIdentifier provides identification of generated API messages.
 type MessageIdentifier interface {
 	// GetMessageID returns message identifier of given API message.
 	GetMessageID(msg api.Message) (uint16, error)
+	// GetMessagePath returns path for the given message
+	GetMessagePath(msg api.Message) string
 	// LookupByID looks up message name and crc by ID
-	LookupByID(msgID uint16) (api.Message, error)
+	LookupByID(path string, msgID uint16) (api.Message, error)
 }
 
 // vppRequest is a request that will be sent to VPP.
@@ -77,14 +82,14 @@ type multiRequestCtx struct {
 
 // subscriptionCtx is a context of subscription for delivery of specific notification messages.
 type subscriptionCtx struct {
-	ch         *Channel
+	conn       *Connection
 	notifChan  chan api.Message   // channel where notification messages will be delivered to
 	msgID      uint16             // message ID for the subscribed event message
 	event      api.Message        // event message that this subscription is for
 	msgFactory func() api.Message // function that returns a new instance of the specific message that is expected as a notification
 }
 
-// channel is the main communication interface with govpp core. It contains four Go channels, one for sending the requests
+// Channel is the main communication interface with govpp core. It contains four Go channels, one for sending the requests
 // to VPP, one for receiving the replies from it and the same set for notifications. The user can access the Go channels
 // via methods provided by Channel interface in this package. Do not use the same channel from multiple goroutines
 // concurrently, otherwise the responses could mix! Use multiple channels instead.
@@ -100,24 +105,64 @@ type Channel struct {
 
 	lastSeqNum uint16 // sequence number of the last sent request
 
-	delayedReply *vppReply     // reply already taken from ReplyChan, buffered for later delivery
-	replyTimeout time.Duration // maximum time that the API waits for a reply from VPP before returning an error, can be set with SetReplyTimeout
+	delayedReply        *vppReply     // reply already taken from ReplyChan, buffered for later delivery
+	replyTimeout        time.Duration // maximum time that the API waits for a reply from VPP before returning an error, can be set with SetReplyTimeout
+	receiveReplyTimeout time.Duration // maximum time that we wait for receiver to consume reply
 }
 
-func newChannel(id uint16, conn *Connection, codec MessageCodec, identifier MessageIdentifier, reqSize, replySize int) *Channel {
-	return &Channel{
-		id:            id,
-		conn:          conn,
-		msgCodec:      codec,
-		msgIdentifier: identifier,
-		reqChan:       make(chan *vppRequest, reqSize),
-		replyChan:     make(chan *vppReply, replySize),
-		replyTimeout:  DefaultReplyTimeout,
+func (c *Connection) newChannel(reqChanBufSize, replyChanBufSize int) (*Channel, error) {
+	// get an ID from the ID pool
+	chID, err := c.channelIdPool.Get()
+	if err != nil {
+		return nil, err
 	}
+	l := log.WithField("id", chID)
+	if isDebugOn(debugOptChannels) {
+		l.Debugf("start preparing channel")
+	}
+	// get a channel from the channel pool
+	channel := c.channelPool.Get()
+	if channel == nil {
+		c.channelIdPool.Put(chID)
+		return nil, errors.New("no more channels in pool available")
+	}
+	// set channel ID
+	channel.id = chID
+	// recreate request/reply channels if not the right capacity
+	if cap(channel.reqChan) != reqChanBufSize {
+		channel.reqChan = make(chan *vppRequest, reqChanBufSize)
+	}
+	if cap(channel.replyChan) != replyChanBufSize {
+		channel.replyChan = make(chan *vppReply, replyChanBufSize)
+	}
+	// store API channel within the client
+	c.channelsLock.Lock()
+	c.channels[channel.id] = channel
+	c.channelsLock.Unlock()
+	if isDebugOn(debugOptChannels) {
+		l.Debugf("done preparing channel")
+	}
+	return channel, nil
+}
+
+func (ch *Channel) Close() {
+	close(ch.reqChan)
 }
 
 func (ch *Channel) GetID() uint16 {
 	return ch.id
+}
+
+func (ch *Channel) SendRequest(msg api.Message) api.RequestCtx {
+	req := ch.newRequest(msg, false)
+	ch.reqChan <- req
+	return &requestCtx{ch: ch, seqNum: req.seqNum}
+}
+
+func (ch *Channel) SendMultiRequest(msg api.Message) api.MultiRequestCtx {
+	req := ch.newRequest(msg, true)
+	ch.reqChan <- req
+	return &multiRequestCtx{ch: ch, seqNum: req.seqNum}
 }
 
 func (ch *Channel) nextSeqNum() uint16 {
@@ -125,23 +170,12 @@ func (ch *Channel) nextSeqNum() uint16 {
 	return ch.lastSeqNum
 }
 
-func (ch *Channel) SendRequest(msg api.Message) api.RequestCtx {
-	seqNum := ch.nextSeqNum()
-	ch.reqChan <- &vppRequest{
+func (ch *Channel) newRequest(msg api.Message, multi bool) *vppRequest {
+	return &vppRequest{
 		msg:    msg,
-		seqNum: seqNum,
+		seqNum: ch.nextSeqNum(),
+		multi:  multi,
 	}
-	return &requestCtx{ch: ch, seqNum: seqNum}
-}
-
-func (ch *Channel) SendMultiRequest(msg api.Message) api.MultiRequestCtx {
-	seqNum := ch.nextSeqNum()
-	ch.reqChan <- &vppRequest{
-		msg:    msg,
-		seqNum: seqNum,
-		multi:  true,
-	}
-	return &multiRequestCtx{ch: ch, seqNum: seqNum}
 }
 
 func (ch *Channel) CheckCompatiblity(msgs ...api.Message) error {
@@ -150,16 +184,23 @@ func (ch *Channel) CheckCompatiblity(msgs ...api.Message) error {
 		_, err := ch.msgIdentifier.GetMessageID(msg)
 		if err != nil {
 			if uerr, ok := err.(*adapter.UnknownMsgError); ok {
-				m := fmt.Sprintf("%s_%s", uerr.MsgName, uerr.MsgCrc)
-				comperr.IncompatibleMessages = append(comperr.IncompatibleMessages, m)
+				comperr.IncompatibleMessages = append(comperr.IncompatibleMessages, getMsgID(uerr.MsgName, uerr.MsgCrc))
 				continue
 			}
 			// other errors return immediatelly
 			return err
 		}
+		comperr.CompatibleMessages = append(comperr.CompatibleMessages, getMsgNameWithCrc(msg))
 	}
 	if len(comperr.IncompatibleMessages) == 0 {
 		return nil
+	}
+	if debugOn {
+		s := ""
+		for _, msg := range comperr.IncompatibleMessages {
+			s += fmt.Sprintf(" - %s\n", msg)
+		}
+		log.Debugf("ERROR: check compatibility: %v:\nIncompatible messages:\n%v", comperr, s)
 	}
 	return &comperr
 }
@@ -167,15 +208,17 @@ func (ch *Channel) CheckCompatiblity(msgs ...api.Message) error {
 func (ch *Channel) SubscribeNotification(notifChan chan api.Message, event api.Message) (api.SubscriptionCtx, error) {
 	msgID, err := ch.msgIdentifier.GetMessageID(event)
 	if err != nil {
-		log.WithFields(logrus.Fields{
-			"msg_name": event.GetMessageName(),
-			"msg_crc":  event.GetCrcString(),
-		}).Errorf("unable to retrieve message ID: %v", err)
+		if debugOn {
+			log.WithFields(logrus.Fields{
+				"msg_name": event.GetMessageName(),
+				"msg_crc":  event.GetCrcString(),
+			}).Errorf("unable to retrieve message ID: %v", err)
+		}
 		return nil, fmt.Errorf("unable to retrieve event message ID: %v", err)
 	}
 
 	sub := &subscriptionCtx{
-		ch:         ch,
+		conn:       ch.conn,
 		notifChan:  notifChan,
 		msgID:      msgID,
 		event:      event,
@@ -193,10 +236,6 @@ func (ch *Channel) SubscribeNotification(notifChan chan api.Message, event api.M
 
 func (ch *Channel) SetReplyTimeout(timeout time.Duration) {
 	ch.replyTimeout = timeout
-}
-
-func (ch *Channel) Close() {
-	close(ch.reqChan)
 }
 
 func (req *requestCtx) ReceiveReply(msg api.Message) error {
@@ -229,19 +268,23 @@ func (sub *subscriptionCtx) Unsubscribe() error {
 	}).Debug("Removing notification subscription.")
 
 	// remove the subscription from the map
-	sub.ch.conn.subscriptionsLock.Lock()
-	defer sub.ch.conn.subscriptionsLock.Unlock()
+	sub.conn.subscriptionsLock.Lock()
+	defer sub.conn.subscriptionsLock.Unlock()
 
-	for i, item := range sub.ch.conn.subscriptions[sub.msgID] {
+	for i, item := range sub.conn.subscriptions[sub.msgID] {
 		if item == sub {
+			// close notification channel
+			close(sub.conn.subscriptions[sub.msgID][i].notifChan)
 			// remove i-th item in the slice
-			sub.ch.conn.subscriptions[sub.msgID] = append(sub.ch.conn.subscriptions[sub.msgID][:i], sub.ch.conn.subscriptions[sub.msgID][i+1:]...)
+			sub.conn.subscriptions[sub.msgID] = append(sub.conn.subscriptions[sub.msgID][:i], sub.conn.subscriptions[sub.msgID][i+1:]...)
 			return nil
 		}
 	}
 
 	return fmt.Errorf("subscription for %q not found", sub.event.GetMessageName())
 }
+
+const maxInt64 = 1<<63 - 1
 
 // receiveReplyInternal receives a reply from the reply channel into the provided msg structure.
 func (ch *Channel) receiveReplyInternal(msg api.Message, expSeqNum uint16) (lastReplyReceived bool, err error) {
@@ -260,7 +303,17 @@ func (ch *Channel) receiveReplyInternal(msg api.Message, expSeqNum uint16) (last
 		}
 	}
 
-	timer := time.NewTimer(ch.replyTimeout)
+	slowReplyDur := WarnSlowReplyDuration
+	timeout := ch.replyTimeout
+	if timeout <= 0 {
+		timeout = maxInt64
+	}
+	timeoutTimer := time.NewTimer(timeout)
+	slowTimer := time.NewTimer(slowReplyDur)
+	defer func() {
+		timeoutTimer.Stop()
+		slowTimer.Stop()
+	}()
 	for {
 		select {
 		// blocks until a reply comes to ReplyChan or until timeout expires
@@ -274,13 +327,18 @@ func (ch *Channel) receiveReplyInternal(msg api.Message, expSeqNum uint16) (last
 				continue
 			}
 			return lastReplyReceived, err
-
-		case <-timer.C:
+		case <-slowTimer.C:
 			log.WithFields(logrus.Fields{
 				"expSeqNum": expSeqNum,
 				"channel":   ch.id,
-			}).Debugf("timeout (%v) waiting for reply: %s", ch.replyTimeout, msg.GetMessageName())
-			err = fmt.Errorf("no reply received within the timeout period %s", ch.replyTimeout)
+			}).Warnf("reply is taking too long (>%v): %v ", slowReplyDur, msg.GetMessageName())
+			continue
+		case <-timeoutTimer.C:
+			log.WithFields(logrus.Fields{
+				"expSeqNum": expSeqNum,
+				"channel":   ch.id,
+			}).Debugf("timeout (%v) waiting for reply: %s", timeout, msg.GetMessageName())
+			err = fmt.Errorf("no reply received within the timeout period %s", timeout)
 			return false, err
 		}
 	}
@@ -322,15 +380,16 @@ func (ch *Channel) processReply(reply *vppReply, expSeqNum uint16, msg api.Messa
 
 	if reply.msgID != expMsgID {
 		var msgNameCrc string
-		if replyMsg, err := ch.msgIdentifier.LookupByID(reply.msgID); err != nil {
+		pkgPath := ch.msgIdentifier.GetMessagePath(msg)
+		if replyMsg, err := ch.msgIdentifier.LookupByID(pkgPath, reply.msgID); err != nil {
 			msgNameCrc = err.Error()
 		} else {
 			msgNameCrc = getMsgNameWithCrc(replyMsg)
 		}
 
-		err = fmt.Errorf("received invalid message ID (seqNum=%d), expected %d (%s), but got %d (%s) "+
+		err = fmt.Errorf("received unexpected message (seqNum=%d), expected %s (ID %d), but got %s (ID %d) "+
 			"(check if multiple goroutines are not sharing single GoVPP channel)",
-			reply.seqNum, expMsgID, msg.GetMessageName(), reply.msgID, msgNameCrc)
+			reply.seqNum, msg.GetMessageName(), expMsgID, msgNameCrc, reply.msgID)
 		return
 	}
 
@@ -343,10 +402,75 @@ func (ch *Channel) processReply(reply *vppReply, expSeqNum uint16, msg api.Messa
 	if strings.HasSuffix(msg.GetMessageName(), "_reply") {
 		// TODO: use categories for messages to avoid checking message name
 		if f := reflect.Indirect(reflect.ValueOf(msg)).FieldByName("Retval"); f.IsValid() {
-			retval := int32(f.Int())
+			var retval int32
+			switch f.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				retval = int32(f.Int())
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				retval = int32(f.Uint())
+			default:
+				logrus.Warnf("invalid kind (%v) for Retval field of message %v", f.Kind(), msg.GetMessageName())
+			}
 			err = api.RetvalToVPPApiError(retval)
 		}
 	}
 
 	return
+}
+
+func (ch *Channel) Reset() {
+	if len(ch.reqChan) > 0 || len(ch.replyChan) > 0 {
+		log.WithField("channel", ch.id).Debugf("draining channel buffers (req: %d, reply: %d)", len(ch.reqChan), len(ch.replyChan))
+	}
+	// Drain any lingering items in the buffers
+	for empty := false; !empty; {
+		// channels must be set to nil when closed to prevent
+		// select below to always run the case immediatelly
+		// which would make the loop run forever
+		select {
+		case _, ok := <-ch.reqChan:
+			if !ok {
+				ch.reqChan = nil
+			}
+		case _, ok := <-ch.replyChan:
+			if !ok {
+				ch.replyChan = nil
+			}
+		default:
+			empty = true
+		}
+	}
+}
+
+type idPool struct {
+	ids  []uint16
+	lock sync.Mutex
+}
+
+func newIDPool(maxID uint16) *idPool {
+	ids := make([]uint16, maxID)
+	for i := uint16(0); i < maxID; i++ {
+		ids[i] = i + 1
+	}
+	return &idPool{ids: ids}
+}
+
+func (p *idPool) Get() (uint16, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if len(p.ids) == 0 {
+		return 0, errors.New("no more IDs available")
+	}
+
+	id := p.ids[0]
+	p.ids = p.ids[1:]
+
+	return id, nil
+}
+
+func (p *idPool) Put(id uint16) {
+	p.lock.Lock()
+	p.ids = append(p.ids, id)
+	p.lock.Unlock()
 }

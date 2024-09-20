@@ -17,7 +17,7 @@
 package mock
 
 import (
-	"bytes"
+	"encoding/binary"
 	"log"
 	"reflect"
 	"sync"
@@ -26,7 +26,6 @@ import (
 	"github.com/alkiranet/govpp/adapter/mock/binapi"
 	"github.com/alkiranet/govpp/api"
 	"github.com/alkiranet/govpp/codec"
-	"github.com/lunixbochs/struc"
 )
 
 type replyMode int
@@ -45,17 +44,53 @@ type VppAdapter struct {
 	access       sync.RWMutex
 	msgNameToIds map[string]uint16
 	msgIDsToName map[uint16]string
-	binAPITypes  map[string]reflect.Type
+	binAPITypes  map[string]map[string]reflect.Type
 
 	repliesLock   sync.Mutex     // mutex for the queue
 	replies       []reply        // FIFO queue of messages
 	replyHandlers []ReplyHandler // callbacks that are able to calculate mock responses
 	mode          replyMode      // mode in which the mock operates
+
+	connectError       error  // error to be returned in Connect()
+	connectCallback    func() // callback to be called in Connect()
+	disconnectCallback func() // callback to be called in Disconnect()
 }
 
 // defaultReply is a default reply message that mock adapter returns for a request.
 type defaultReply struct {
 	Retval int32
+}
+
+func (*defaultReply) GetMessageName() string { return "mock_default_reply" }
+func (*defaultReply) GetCrcString() string   { return "xxxxxxxx" }
+func (*defaultReply) GetMessageType() api.MessageType {
+	return api.ReplyMessage
+}
+func (m *defaultReply) Size() int {
+	if m == nil {
+		return 0
+	}
+	var size int
+	// field[1] m.Retval
+	size += 4
+	return size
+}
+func (m *defaultReply) Marshal(b []byte) ([]byte, error) {
+	var buf *codec.Buffer
+	if b == nil {
+		buf = codec.NewBuffer(make([]byte, m.Size()))
+	} else {
+		buf = codec.NewBuffer(b)
+	}
+	// field[1] m.Retval
+	buf.EncodeUint32(uint32(m.Retval))
+	return buf.Bytes(), nil
+}
+func (m *defaultReply) Unmarshal(b []byte) error {
+	buf := codec.NewBuffer(b)
+	// field[1] m.Retval
+	m.Retval = int32(buf.DecodeUint32())
+	return nil
 }
 
 // MessageDTO is a structure used for propagating information to ReplyHandlers.
@@ -95,7 +130,7 @@ func NewVppAdapter() *VppAdapter {
 		msgIDSeq:     1000,
 		msgIDsToName: make(map[uint16]string),
 		msgNameToIds: make(map[string]uint16),
-		binAPITypes:  make(map[string]reflect.Type),
+		binAPITypes:  make(map[string]map[string]reflect.Type),
 	}
 	a.registerBinAPITypes()
 	return a
@@ -103,11 +138,17 @@ func NewVppAdapter() *VppAdapter {
 
 // Connect emulates connecting the process to VPP.
 func (a *VppAdapter) Connect() error {
-	return nil
+	if a.connectCallback != nil {
+		a.connectCallback()
+	}
+	return a.connectError
 }
 
 // Disconnect emulates disconnecting the process from VPP.
 func (a *VppAdapter) Disconnect() error {
+	if a.disconnectCallback != nil {
+		a.disconnectCallback()
+	}
 	return nil
 }
 
@@ -134,19 +175,25 @@ func (a *VppAdapter) GetMsgNameByID(msgID uint16) (string, bool) {
 func (a *VppAdapter) registerBinAPITypes() {
 	a.access.Lock()
 	defer a.access.Unlock()
-	for _, msg := range api.GetRegisteredMessages() {
-		a.binAPITypes[msg.GetMessageName()] = reflect.TypeOf(msg).Elem()
+	for pkg, msgs := range api.GetRegisteredMessages() {
+		msgMap := make(map[string]reflect.Type)
+		for _, msg := range msgs {
+			msgMap[msg.GetMessageName()] = reflect.TypeOf(msg).Elem()
+		}
+		a.binAPITypes[pkg] = msgMap
 	}
 }
 
 // ReplyTypeFor returns reply message type for given request message name.
-func (a *VppAdapter) ReplyTypeFor(requestMsgName string) (reflect.Type, uint16, bool) {
+func (a *VppAdapter) ReplyTypeFor(pkg, requestMsgName string) (reflect.Type, uint16, bool) {
 	replyName, foundName := binapi.ReplyNameFor(requestMsgName)
 	if foundName {
-		if reply, found := a.binAPITypes[replyName]; found {
-			msgID, err := a.GetMsgID(replyName, "")
-			if err == nil {
-				return reply, msgID, found
+		if messages, found := a.binAPITypes[pkg]; found {
+			if reply, found := messages[replyName]; found {
+				msgID, err := a.GetMsgID(replyName, "")
+				if err == nil {
+					return reply, msgID, found
+				}
 			}
 		}
 	}
@@ -155,8 +202,8 @@ func (a *VppAdapter) ReplyTypeFor(requestMsgName string) (reflect.Type, uint16, 
 }
 
 // ReplyFor returns reply message for given request message name.
-func (a *VppAdapter) ReplyFor(requestMsgName string) (api.Message, uint16, bool) {
-	replType, msgID, foundReplType := a.ReplyTypeFor(requestMsgName)
+func (a *VppAdapter) ReplyFor(pkg, requestMsgName string) (api.Message, uint16, bool) {
+	replType, msgID, foundReplType := a.ReplyTypeFor(pkg, requestMsgName)
 	if foundReplType {
 		msgVal := reflect.New(replType)
 		if msg, ok := msgVal.Interface().(api.Message); ok {
@@ -178,19 +225,16 @@ func (a *VppAdapter) ReplyBytes(request MessageDTO, reply api.Message) ([]byte, 
 	}
 	log.Println("ReplyBytes ", replyMsgID, " ", reply.GetMessageName(), " clientId: ", request.ClientID)
 
-	buf := new(bytes.Buffer)
-	err = struc.Pack(buf, &codec.VppReplyHeader{
-		VlMsgID: replyMsgID,
-		Context: request.ClientID,
-	})
+	data, err := codec.DefaultCodec.EncodeMsg(reply, replyMsgID)
 	if err != nil {
 		return nil, err
 	}
-	if err = struc.Pack(buf, reply); err != nil {
-		return nil, err
+	if reply.GetMessageType() == api.ReplyMessage {
+		binary.BigEndian.PutUint32(data[2:6], request.ClientID)
+	} else if reply.GetMessageType() == api.RequestMessage {
+		binary.BigEndian.PutUint32(data[6:10], request.ClientID)
 	}
-
-	return buf.Bytes(), nil
+	return data, nil
 }
 
 // GetMsgID returns mocked message ID for the given message name and CRC.
@@ -224,21 +268,22 @@ func (a *VppAdapter) GetMsgID(msgName string, msgCrc string) (uint16, error) {
 
 // SendMsg emulates sending a binary-encoded message to VPP.
 func (a *VppAdapter) SendMsg(clientID uint32, data []byte) error {
-	switch a.mode {
+	a.repliesLock.Lock()
+	mode := a.mode
+	a.repliesLock.Unlock()
+	switch mode {
 	case useReplyHandlers:
 		for i := len(a.replyHandlers) - 1; i >= 0; i-- {
 			replyHandler := a.replyHandlers[i]
 
-			buf := bytes.NewReader(data)
-			reqHeader := codec.VppRequestHeader{}
-			struc.Unpack(buf, &reqHeader)
+			msgID := binary.BigEndian.Uint16(data[0:2])
 
 			a.access.Lock()
-			reqMsgName := a.msgIDsToName[reqHeader.VlMsgID]
+			reqMsgName := a.msgIDsToName[msgID]
 			a.access.Unlock()
 
 			reply, msgID, finished := replyHandler(MessageDTO{
-				MsgID:    reqHeader.VlMsgID,
+				MsgID:    msgID,
 				MsgName:  reqMsgName,
 				ClientID: clientID,
 				Data:     data,
@@ -259,23 +304,21 @@ func (a *VppAdapter) SendMsg(clientID uint32, data []byte) error {
 			reply := a.replies[0]
 			for _, msg := range reply.msgs {
 				msgID, _ := a.GetMsgID(msg.Msg.GetMessageName(), msg.Msg.GetCrcString())
-				buf := new(bytes.Buffer)
 				context := clientID
 				if msg.hasCtx {
 					context = setMultipart(context, msg.Multipart)
 					context = setSeqNum(context, msg.SeqNum)
 				}
-				if msg.Msg.GetMessageType() == api.ReplyMessage {
-					struc.Pack(buf, &codec.VppReplyHeader{VlMsgID: msgID, Context: context})
-				} else if msg.Msg.GetMessageType() == api.RequestMessage {
-					struc.Pack(buf, &codec.VppRequestHeader{VlMsgID: msgID, Context: context})
-				} else if msg.Msg.GetMessageType() == api.EventMessage {
-					struc.Pack(buf, &codec.VppEventHeader{VlMsgID: msgID})
-				} else {
-					struc.Pack(buf, &codec.VppOtherHeader{VlMsgID: msgID})
+				data, err := codec.DefaultCodec.EncodeMsg(msg.Msg, msgID)
+				if err != nil {
+					panic(err)
 				}
-				struc.Pack(buf, msg.Msg)
-				a.callback(msgID, buf.Bytes())
+				if msg.Msg.GetMessageType() == api.ReplyMessage {
+					binary.BigEndian.PutUint32(data[2:6], context)
+				} else if msg.Msg.GetMessageType() == api.RequestMessage {
+					binary.BigEndian.PutUint32(data[6:10], context)
+				}
+				a.callback(msgID, data)
 			}
 
 			a.replies = a.replies[1:]
@@ -290,11 +333,13 @@ func (a *VppAdapter) SendMsg(clientID uint32, data []byte) error {
 		//fallthrough
 	default:
 		// return default reply
-		buf := new(bytes.Buffer)
 		msgID := uint16(defaultReplyMsgID)
-		struc.Pack(buf, &codec.VppReplyHeader{VlMsgID: msgID, Context: clientID})
-		struc.Pack(buf, &defaultReply{})
-		a.callback(msgID, buf.Bytes())
+		data, err := codec.DefaultCodec.EncodeMsg(&defaultReply{}, msgID)
+		if err != nil {
+			panic(err)
+		}
+		binary.BigEndian.PutUint32(data[2:6], clientID)
+		a.callback(msgID, data)
 	}
 	return nil
 }
@@ -321,17 +366,17 @@ func (a *VppAdapter) WaitReady() error {
 // exactly two calls of this method.
 // For example:
 //
-//    mockVpp.MockReply(  // push multipart messages all at once
-// 			&interfaces.SwInterfaceDetails{SwIfIndex:1},
-// 			&interfaces.SwInterfaceDetails{SwIfIndex:2},
-// 			&interfaces.SwInterfaceDetails{SwIfIndex:3},
-//    )
-//    mockVpp.MockReply(&vpe.ControlPingReply{})
+//	   mockVpp.MockReply(  // push multipart messages all at once
+//				&interfaces.SwInterfaceDetails{SwIfIndex:1},
+//				&interfaces.SwInterfaceDetails{SwIfIndex:2},
+//				&interfaces.SwInterfaceDetails{SwIfIndex:3},
+//	   )
+//	   mockVpp.MockReply(&vpe.ControlPingReply{})
 //
 // Even if the multipart request has no replies, MockReply has to be called twice:
 //
-//    mockVpp.MockReply()  // zero multipart messages
-//    mockVpp.MockReply(&vpe.ControlPingReply{})
+//	mockVpp.MockReply()  // zero multipart messages
+//	mockVpp.MockReply(&vpe.ControlPingReply{})
 func (a *VppAdapter) MockReply(msgs ...api.Message) {
 	a.repliesLock.Lock()
 	defer a.repliesLock.Unlock()
@@ -394,4 +439,19 @@ func setMultipart(context uint32, isMultipart bool) (newContext uint32) {
 		context |= 1 << 16
 	}
 	return context
+}
+
+// MockConnectError sets an error to be returned in Connect()
+func (a *VppAdapter) MockConnectError(err error) {
+	a.connectError = err
+}
+
+// SetConnectCallback sets a callback to be called in Connect()
+func (a *VppAdapter) SetConnectCallback(cb func()) {
+	a.connectCallback = cb
+}
+
+// SetDisconnectCallback sets a callback to be called in Disconnect()
+func (a *VppAdapter) SetDisconnectCallback(cb func()) {
+	a.disconnectCallback = cb
 }

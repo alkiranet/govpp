@@ -15,154 +15,116 @@
 package codec
 
 import (
-	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"reflect"
 
 	"github.com/alkiranet/govpp/api"
-	"github.com/lunixbochs/struc"
 )
+
+var DefaultCodec = new(MsgCodec)
+
+func EncodeMsg(msg api.Message, msgID uint16) (data []byte, err error) {
+	return DefaultCodec.EncodeMsg(msg, msgID)
+}
+func DecodeMsg(data []byte, msg api.Message) (err error) {
+	return DefaultCodec.DecodeMsg(data, msg)
+}
+func DecodeMsgContext(data []byte, msgType api.MessageType) (context uint32, err error) {
+	return DefaultCodec.DecodeMsgContext(data, msgType)
+}
 
 // MsgCodec provides encoding and decoding functionality of `api.Message` structs into/from
 // binary format as accepted by VPP.
 type MsgCodec struct{}
 
-// VppRequestHeader struct contains header fields implemented by all VPP requests.
-type VppRequestHeader struct {
-	VlMsgID     uint16
-	ClientIndex uint32
-	Context     uint32
-}
-
-// VppReplyHeader struct contains header fields implemented by all VPP replies.
-type VppReplyHeader struct {
-	VlMsgID uint16
-	Context uint32
-}
-
-// VppEventHeader struct contains header fields implemented by all VPP events.
-type VppEventHeader struct {
-	VlMsgID     uint16
-	ClientIndex uint32
-}
-
-// VppOtherHeader struct contains header fields implemented by other VPP messages (not requests nor replies).
-type VppOtherHeader struct {
-	VlMsgID uint16
-}
-
-// EncodeMsg encodes provided `Message` structure into its binary-encoded data representation.
 func (*MsgCodec) EncodeMsg(msg api.Message, msgID uint16) (data []byte, err error) {
 	if msg == nil {
 		return nil, errors.New("nil message passed in")
 	}
 
-	// try to recover panic which might possibly occur in struc.Pack call
+	// try to recover panic which might possibly occur
 	defer func() {
 		if r := recover(); r != nil {
 			var ok bool
 			if err, ok = r.(error); !ok {
 				err = fmt.Errorf("%v", r)
 			}
-			err = fmt.Errorf("panic occurred: %v", err)
+			err = fmt.Errorf("panic occurred during encoding message %s: %v", msg.GetMessageName(), err)
 		}
 	}()
 
-	var header interface{}
-
-	// encode message header
-	switch msg.GetMessageType() {
-	case api.RequestMessage:
-		header = &VppRequestHeader{VlMsgID: msgID}
-	case api.ReplyMessage:
-		header = &VppReplyHeader{VlMsgID: msgID}
-	case api.EventMessage:
-		header = &VppEventHeader{VlMsgID: msgID}
-	default:
-		header = &VppOtherHeader{VlMsgID: msgID}
+	marshaller, ok := msg.(Marshaler)
+	if !ok {
+		marshaller = Wrapper{msg}
 	}
 
-	buf := new(bytes.Buffer)
+	size := marshaller.Size()
+	offset := getOffset(msg)
 
-	// encode message header
-	if err := struc.Pack(buf, header); err != nil {
-		return nil, fmt.Errorf("failed to encode message header: %+v, error: %v", header, err)
+	// encode msg ID
+	b := make([]byte, size+offset)
+	b[0] = byte(msgID >> 8)
+	b[1] = byte(msgID)
+
+	data, err = marshaller.Marshal(b[offset:])
+	if err != nil {
+		return nil, err
 	}
 
-	// encode message content
-	if reflect.TypeOf(msg).Elem().NumField() > 0 {
-		if err := struc.Pack(buf, msg); err != nil {
-			return nil, fmt.Errorf("failed to encode message data: %+v, error: %v", data, err)
-		}
-	}
-
-	return buf.Bytes(), nil
+	return b[0:len(b):len(b)], nil
 }
 
-// DecodeMsg decodes binary-encoded data of a message into provided `Message` structure.
-func (*MsgCodec) DecodeMsg(data []byte, msg api.Message) error {
+func (*MsgCodec) DecodeMsg(data []byte, msg api.Message) (err error) {
 	if msg == nil {
 		return errors.New("nil message passed in")
 	}
 
-	var header interface{}
+	// try to recover panic which might possibly occur
+	defer func() {
+		if r := recover(); r != nil {
+			var ok bool
+			if err, ok = r.(error); !ok {
+				err = fmt.Errorf("%v", r)
+			}
+			err = fmt.Errorf("panic occurred during decoding message %s: %v", msg.GetMessageName(), err)
+		}
+	}()
 
-	// check which header is expected
-	switch msg.GetMessageType() {
-	case api.RequestMessage:
-		header = new(VppRequestHeader)
-	case api.ReplyMessage:
-		header = new(VppReplyHeader)
-	case api.EventMessage:
-		header = new(VppEventHeader)
-	default:
-		header = new(VppOtherHeader)
+	marshaller, ok := msg.(Unmarshaler)
+	if !ok {
+		marshaller = Wrapper{msg}
 	}
 
-	buf := bytes.NewReader(data)
+	offset := getOffset(msg)
 
-	// decode message header
-	if err := struc.Unpack(buf, header); err != nil {
-		return fmt.Errorf("failed to decode message header: %+v, error: %v", header, err)
-	}
-
-	// decode message content
-	if err := struc.Unpack(buf, msg); err != nil {
-		return fmt.Errorf("failed to decode message data: %+v, error: %v", data, err)
+	err = marshaller.Unmarshal(data[offset:])
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func (*MsgCodec) DecodeMsgContext(data []byte, msg api.Message) (uint32, error) {
-	if msg == nil {
-		return 0, errors.New("nil message passed in")
+func (*MsgCodec) DecodeMsgContext(data []byte, msgType api.MessageType) (context uint32, err error) {
+	switch msgType {
+	case api.RequestMessage:
+		return binary.BigEndian.Uint32(data[6:10]), nil
+	case api.ReplyMessage:
+		return binary.BigEndian.Uint32(data[2:6]), nil
 	}
 
-	var header interface{}
-	var getContext func() uint32
+	return 0, nil
+}
 
-	// check which header is expected
+func getOffset(msg api.Message) (offset int) {
 	switch msg.GetMessageType() {
 	case api.RequestMessage:
-		header = new(VppRequestHeader)
-		getContext = func() uint32 { return header.(*VppRequestHeader).Context }
-
+		return 10
 	case api.ReplyMessage:
-		header = new(VppReplyHeader)
-		getContext = func() uint32 { return header.(*VppReplyHeader).Context }
-
-	default:
-		return 0, nil
+		return 6
+	case api.EventMessage:
+		return 6
 	}
-
-	buf := bytes.NewReader(data)
-
-	// decode message header
-	if err := struc.Unpack(buf, header); err != nil {
-		return 0, fmt.Errorf("decoding message header failed: %v", err)
-	}
-
-	return getContext(), nil
+	return 2
 }

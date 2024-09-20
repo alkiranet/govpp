@@ -16,7 +16,6 @@ package adapter
 
 import (
 	"errors"
-	"fmt"
 )
 
 const (
@@ -27,6 +26,7 @@ const (
 var (
 	ErrStatsDataBusy     = errors.New("stats data busy")
 	ErrStatsDirStale     = errors.New("stats dir stale")
+	ErrStatsDisconnected = errors.New("stats disconnected")
 	ErrStatsAccessFailed = errors.New("stats access failed")
 )
 
@@ -37,59 +37,53 @@ type StatsAPI interface {
 	// Disconnect terminates client connection.
 	Disconnect() error
 
-	// ListStats lists names for stats matching patterns.
-	ListStats(patterns ...string) (names []string, err error)
+	// ListStats lists indexed names for stats matching patterns.
+	ListStats(patterns ...string) (indexes []StatIdentifier, err error)
 	// DumpStats dumps all stat entries.
 	DumpStats(patterns ...string) (entries []StatEntry, err error)
 
 	// PrepareDir prepares new stat dir for entries that match any of prefixes.
 	PrepareDir(patterns ...string) (*StatDir, error)
+	// PrepareDirOnIndex prepares new stat dir for entries that match any of indexes.
+	PrepareDirOnIndex(indexes ...uint32) (*StatDir, error)
 	// UpdateDir updates stat dir and all of their entries.
 	UpdateDir(dir *StatDir) error
 }
 
 // StatType represents type of stat directory and simply
 // defines what type of stat data is stored in the stat entry.
-type StatType int
+type StatType string
 
 const (
-	_                     StatType = 0
-	ScalarIndex           StatType = 1
-	SimpleCounterVector   StatType = 2
-	CombinedCounterVector StatType = 3
-	ErrorIndex            StatType = 4
-	NameVector            StatType = 5
+	Unknown               StatType = "UnknownStatType"
+	ScalarIndex           StatType = "ScalarIndex"
+	SimpleCounterVector   StatType = "SimpleCounterVector"
+	CombinedCounterVector StatType = "CombinedCounterVector"
+	ErrorIndex            StatType = "ErrorIndex"
+	NameVector            StatType = "NameVector"
+	Empty                 StatType = "Empty"
+	Symlink               StatType = "Symlink"
 )
-
-func (d StatType) String() string {
-	switch d {
-	case ScalarIndex:
-		return "ScalarIndex"
-	case SimpleCounterVector:
-		return "SimpleCounterVector"
-	case CombinedCounterVector:
-		return "CombinedCounterVector"
-	case ErrorIndex:
-		return "ErrorIndex"
-	case NameVector:
-		return "NameVector"
-	}
-	return fmt.Sprintf("UnknownStatType(%d)", d)
-}
 
 // StatDir defines directory of stats entries created by PrepareDir.
 type StatDir struct {
 	Epoch   int64
-	Indexes []uint32
 	Entries []StatEntry
+}
+
+// StatIdentifier holds a stat entry name and index
+type StatIdentifier struct {
+	Index uint32
+	Name  []byte
 }
 
 // StatEntry represents single stat entry. The type of stat stored in Data
 // is defined by Type.
 type StatEntry struct {
-	Name []byte
-	Type StatType
-	Data Stat
+	StatIdentifier
+	Type    StatType
+	Data    Stat
+	Symlink bool
 }
 
 // Counter represents simple counter with single value, which is usually packet count.
@@ -99,11 +93,11 @@ type Counter uint64
 type CombinedCounter [2]uint64
 
 func (s CombinedCounter) Packets() uint64 {
-	return uint64(s[0])
+	return s[0]
 }
 
 func (s CombinedCounter) Bytes() uint64 {
-	return uint64(s[1])
+	return s[1]
 }
 
 // Name represents string value stored under name vector.
@@ -118,6 +112,9 @@ type Stat interface {
 	// IsZero returns true if all of its values equal to zero.
 	IsZero() bool
 
+	// Type returns underlying type of a stat
+	Type() StatType
+
 	// isStat is intentionally  unexported to limit implementations of interface to this package,
 	isStat()
 }
@@ -125,16 +122,16 @@ type Stat interface {
 // ScalarStat represents stat for ScalarIndex.
 type ScalarStat float64
 
-// ErrorStat represents stat for ErrorIndex.
-type ErrorStat Counter
+// ErrorStat represents stat for ErrorIndex. The array represents workers.
+type ErrorStat []Counter
 
-// SimpleCounterStat represents stat for SimpleCounterVector.
+// SimpleCounterStat represents indexed stat for SimpleCounterVector.
 // The outer array represents workers and the inner array represents interface/node/.. indexes.
 // Values should be aggregated per interface/node for every worker.
 // ReduceSimpleCounterStatIndex can be used to reduce specific index.
 type SimpleCounterStat [][]Counter
 
-// CombinedCounterStat represents stat for CombinedCounterVector.
+// CombinedCounterStat represents indexed stat for CombinedCounterVector.
 // The outer array represents workers and the inner array represents interface/node/.. indexes.
 // Values should be aggregated per interface/node for every worker.
 // ReduceCombinedCounterStatIndex can be used to reduce specific index.
@@ -143,18 +140,40 @@ type CombinedCounterStat [][]CombinedCounter
 // NameStat represents stat for NameVector.
 type NameStat []Name
 
+// EmptyStat represents removed counter directory
+type EmptyStat string
+
 func (ScalarStat) isStat()          {}
 func (ErrorStat) isStat()           {}
 func (SimpleCounterStat) isStat()   {}
 func (CombinedCounterStat) isStat() {}
 func (NameStat) isStat()            {}
+func (EmptyStat) isStat()           {}
 
 func (s ScalarStat) IsZero() bool {
 	return s == 0
 }
-func (s ErrorStat) IsZero() bool {
-	return s == 0
+
+func (s ScalarStat) Type() StatType {
+	return ScalarIndex
 }
+
+func (s ErrorStat) IsZero() bool {
+	if s == nil {
+		return true
+	}
+	for _, ss := range s {
+		if ss != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (s ErrorStat) Type() StatType {
+	return ErrorIndex
+}
+
 func (s SimpleCounterStat) IsZero() bool {
 	if s == nil {
 		return true
@@ -168,6 +187,11 @@ func (s SimpleCounterStat) IsZero() bool {
 	}
 	return true
 }
+
+func (s SimpleCounterStat) Type() StatType {
+	return SimpleCounterVector
+}
+
 func (s CombinedCounterStat) IsZero() bool {
 	if s == nil {
 		return true
@@ -184,6 +208,11 @@ func (s CombinedCounterStat) IsZero() bool {
 	}
 	return true
 }
+
+func (s CombinedCounterStat) Type() StatType {
+	return CombinedCounterVector
+}
+
 func (s NameStat) IsZero() bool {
 	if s == nil {
 		return true
@@ -194,6 +223,18 @@ func (s NameStat) IsZero() bool {
 		}
 	}
 	return true
+}
+
+func (s NameStat) Type() StatType {
+	return NameVector
+}
+
+func (s EmptyStat) IsZero() bool {
+	return true
+}
+
+func (s EmptyStat) Type() StatType {
+	return Empty
 }
 
 // ReduceSimpleCounterStatIndex returns reduced SimpleCounterStat s for index i.
@@ -209,8 +250,8 @@ func ReduceSimpleCounterStatIndex(s SimpleCounterStat, i int) uint64 {
 func ReduceCombinedCounterStatIndex(s CombinedCounterStat, i int) [2]uint64 {
 	var val [2]uint64
 	for _, w := range s {
-		val[0] += uint64(w[i][0])
-		val[1] += uint64(w[i][1])
+		val[0] += w[i][0]
+		val[1] += w[i][1]
 	}
 	return val
 }
