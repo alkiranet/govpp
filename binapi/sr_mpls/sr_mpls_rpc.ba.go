@@ -5,7 +5,7 @@ package sr_mpls
 import (
 	"context"
 
-	api "go.fd.io/govpp/api"
+	api "github.com/alkiranet/govpp/api"
 )
 
 // RPCService defines RPC service sr_mpls.

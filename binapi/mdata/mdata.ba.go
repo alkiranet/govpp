@@ -11,9 +11,9 @@
 package mdata
 
 import (
-	api "go.fd.io/govpp/api"
-	_ "go.fd.io/govpp/binapi/interface_types"
-	codec "go.fd.io/govpp/codec"
+	api "github.com/alkiranet/govpp/api"
+	_ "github.com/alkiranet/govpp/binapi/interface_types"
+	codec "github.com/alkiranet/govpp/codec"
 )
 
 // This is a compile-time assertion to ensure that this generated file

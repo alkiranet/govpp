@@ -15,7 +15,7 @@
 package core
 
 import (
-	"go.fd.io/govpp/api"
+	"github.com/alkiranet/govpp/api"
 	"sort"
 	"sync"
 	"sync/atomic"

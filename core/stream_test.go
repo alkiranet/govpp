@@ -6,7 +6,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
-	"go.fd.io/govpp/adapter/mock"
+	"github.com/alkiranet/govpp/adapter/mock"
 )
 
 type streamCtx struct {

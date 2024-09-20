@@ -19,7 +19,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"go.fd.io/govpp/internal/version"
+	"github.com/alkiranet/govpp/internal/version"
 )
 
 const logo = `

@@ -5,7 +5,7 @@ package p2p_ethernet
 import (
 	"context"
 
-	api "go.fd.io/govpp/api"
+	api "github.com/alkiranet/govpp/api"
 )
 
 // RPCService defines RPC service p2p_ethernet.

@@ -19,12 +19,12 @@ import (
 	"reflect"
 	"testing"
 
-	"go.fd.io/govpp/api"
-	interfaces "go.fd.io/govpp/binapi/interface"
-	"go.fd.io/govpp/binapi/interface_types"
-	"go.fd.io/govpp/binapi/ip_types"
-	"go.fd.io/govpp/binapi/sr"
-	"go.fd.io/govpp/codec"
+	"github.com/alkiranet/govpp/api"
+	interfaces "github.com/alkiranet/govpp/binapi/interface"
+	"github.com/alkiranet/govpp/binapi/interface_types"
+	"github.com/alkiranet/govpp/binapi/ip_types"
+	"github.com/alkiranet/govpp/binapi/sr"
+	"github.com/alkiranet/govpp/codec"
 )
 
 // CliInband represents VPP binary API message 'cli_inband'.

@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"testing"
 
-	"go.fd.io/govpp/api"
-	"go.fd.io/govpp/binapi/vpe"
-	"go.fd.io/govpp/test/vpptesting"
+	"github.com/alkiranet/govpp/api"
+	"github.com/alkiranet/govpp/binapi/vpe"
+	"github.com/alkiranet/govpp/test/vpptesting"
 )
 
 func TestTrace(t *testing.T) {

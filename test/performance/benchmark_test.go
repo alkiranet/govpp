@@ -17,11 +17,11 @@ package performance
 import (
 	"testing"
 
-	"go.fd.io/govpp/adapter"
-	"go.fd.io/govpp/adapter/statsclient"
-	"go.fd.io/govpp/api"
-	"go.fd.io/govpp/core"
-	"go.fd.io/govpp/test/vpptesting"
+	"github.com/alkiranet/govpp/adapter"
+	"github.com/alkiranet/govpp/adapter/statsclient"
+	"github.com/alkiranet/govpp/api"
+	"github.com/alkiranet/govpp/core"
+	"github.com/alkiranet/govpp/test/vpptesting"
 )
 
 func newStatsClient() adapter.StatsAPI {

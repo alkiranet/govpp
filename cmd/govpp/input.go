@@ -22,7 +22,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"go.fd.io/govpp/binapigen/vppapi"
+	"github.com/alkiranet/govpp/binapigen/vppapi"
 )
 
 func resolveInput(input string) (*vppapi.VppInput, error) {

@@ -6,13 +6,13 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"go.fd.io/govpp/api"
-	interfaces "go.fd.io/govpp/binapi/interface"
-	"go.fd.io/govpp/binapi/ip"
-	"go.fd.io/govpp/binapi/l2"
-	"go.fd.io/govpp/binapi/memclnt"
-	"go.fd.io/govpp/binapi/memif"
-	"go.fd.io/govpp/core"
+	"github.com/alkiranet/govpp/api"
+	interfaces "github.com/alkiranet/govpp/binapi/interface"
+	"github.com/alkiranet/govpp/binapi/ip"
+	"github.com/alkiranet/govpp/binapi/l2"
+	"github.com/alkiranet/govpp/binapi/memclnt"
+	"github.com/alkiranet/govpp/binapi/memif"
+	"github.com/alkiranet/govpp/core"
 )
 
 func TestTraceEnabled(t *testing.T) {

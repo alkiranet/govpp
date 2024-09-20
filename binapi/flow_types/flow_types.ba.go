@@ -15,10 +15,10 @@ package flow_types
 import (
 	"strconv"
 
-	api "go.fd.io/govpp/api"
-	ethernet_types "go.fd.io/govpp/binapi/ethernet_types"
-	ip_types "go.fd.io/govpp/binapi/ip_types"
-	codec "go.fd.io/govpp/codec"
+	api "github.com/alkiranet/govpp/api"
+	ethernet_types "github.com/alkiranet/govpp/binapi/ethernet_types"
+	ip_types "github.com/alkiranet/govpp/binapi/ip_types"
+	codec "github.com/alkiranet/govpp/codec"
 )
 
 // This is a compile-time assertion to ensure that this generated file

@@ -13,7 +13,7 @@ package ethernet_types
 import (
 	"net"
 
-	api "go.fd.io/govpp/api"
+	api "github.com/alkiranet/govpp/api"
 )
 
 // This is a compile-time assertion to ensure that this generated file

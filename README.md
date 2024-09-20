@@ -4,7 +4,7 @@
 
 <p align="center">
 	<a href="https://github.com/FDio/govpp/tags"><img src="https://img.shields.io/github/v/tag/fdio/govpp?label=latest&logo=github&sort=semver&color=blue" alt="Latest"></a>
-	<a href="https://pkg.go.dev/go.fd.io/govpp"><img src="https://pkg.go.dev/badge/go.fd.io/govpp" alt="PkgGoDev"></a>
+	<a href="https://pkg.go.dev/github.com/alkiranet/govpp"><img src="https://pkg.go.dev/badge/github.com/alkiranet/govpp" alt="PkgGoDev"></a>
 	<a href="https://github.com/FDio/govpp/actions/workflows/ci.yaml"><img src="https://github.com/FDio/govpp/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
 	<a href="https://github.com/FDio/govpp/actions/workflows/test.yaml"><img src="https://github.com/FDio/govpp/actions/workflows/test.yaml/badge.svg" alt="Test"></a>
 </p>
@@ -61,7 +61,7 @@ For complete code examples demonstrating vrious GoVPP features, please refer to 
 Refer to [User Guide](docs/USER_GUIDE.md) document for info about how to use GoVPP. 
 If you run into any issues or need some help with debugging GoVPP, read our [Troubleshooting](docs/TROUBLESHOOTING.md) document.
 
-Go reference docs are available at [pkg.go.dev](https://pkg.go.dev/go.fd.io/govpp). 
+Go reference docs are available at [pkg.go.dev](https://pkg.go.dev/github.com/alkiranet/govpp). 
 
 For other documentation refer to [docs](docs) directory.
 

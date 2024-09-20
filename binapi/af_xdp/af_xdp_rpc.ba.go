@@ -5,7 +5,7 @@ package af_xdp
 import (
 	"context"
 
-	api "go.fd.io/govpp/api"
+	api "github.com/alkiranet/govpp/api"
 )
 
 // RPCService defines RPC service af_xdp.

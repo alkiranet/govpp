@@ -28,8 +28,8 @@ const (
 const (
 	strconvPkg = GoImportPath("strconv")
 
-	govppApiPkg   = GoImportPath("go.fd.io/govpp/api")
-	govppCodecPkg = GoImportPath("go.fd.io/govpp/codec")
+	govppApiPkg   = GoImportPath("github.com/alkiranet/govpp/api")
+	govppCodecPkg = GoImportPath("github.com/alkiranet/govpp/codec")
 )
 
 func genCodeGeneratedComment(g *GenFile) {

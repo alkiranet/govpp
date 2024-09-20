@@ -14,9 +14,9 @@ package mss_clamp
 import (
 	"strconv"
 
-	api "go.fd.io/govpp/api"
-	interface_types "go.fd.io/govpp/binapi/interface_types"
-	codec "go.fd.io/govpp/codec"
+	api "github.com/alkiranet/govpp/api"
+	interface_types "github.com/alkiranet/govpp/binapi/interface_types"
+	codec "github.com/alkiranet/govpp/codec"
 )
 
 // This is a compile-time assertion to ensure that this generated file

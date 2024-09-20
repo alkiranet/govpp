@@ -19,9 +19,9 @@ import (
 	"io"
 	"testing"
 
-	interfaces "go.fd.io/govpp/binapi/interface"
-	"go.fd.io/govpp/binapi/vpe"
-	"go.fd.io/govpp/test/vpptesting"
+	interfaces "github.com/alkiranet/govpp/binapi/interface"
+	"github.com/alkiranet/govpp/binapi/vpe"
+	"github.com/alkiranet/govpp/test/vpptesting"
 )
 
 // TestVersion tests that getting VPP version works.

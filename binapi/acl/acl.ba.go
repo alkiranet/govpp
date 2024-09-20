@@ -11,12 +11,12 @@
 package acl
 
 import (
-	api "go.fd.io/govpp/api"
-	acl_types "go.fd.io/govpp/binapi/acl_types"
-	_ "go.fd.io/govpp/binapi/ethernet_types"
-	interface_types "go.fd.io/govpp/binapi/interface_types"
-	ip_types "go.fd.io/govpp/binapi/ip_types"
-	codec "go.fd.io/govpp/codec"
+	api "github.com/alkiranet/govpp/api"
+	acl_types "github.com/alkiranet/govpp/binapi/acl_types"
+	_ "github.com/alkiranet/govpp/binapi/ethernet_types"
+	interface_types "github.com/alkiranet/govpp/binapi/interface_types"
+	ip_types "github.com/alkiranet/govpp/binapi/ip_types"
+	codec "github.com/alkiranet/govpp/codec"
 )
 
 // This is a compile-time assertion to ensure that this generated file

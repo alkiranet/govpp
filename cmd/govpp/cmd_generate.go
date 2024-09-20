@@ -21,8 +21,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"go.fd.io/govpp/binapigen"
-	"go.fd.io/govpp/binapigen/vppapi"
+	"github.com/alkiranet/govpp/binapigen"
+	"github.com/alkiranet/govpp/binapigen/vppapi"
 )
 
 type GenerateOptions struct {

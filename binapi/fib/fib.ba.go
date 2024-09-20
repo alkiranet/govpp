@@ -12,10 +12,10 @@
 package fib
 
 import (
-	api "go.fd.io/govpp/api"
-	_ "go.fd.io/govpp/binapi/fib_types"
-	_ "go.fd.io/govpp/binapi/ip_types"
-	codec "go.fd.io/govpp/codec"
+	api "github.com/alkiranet/govpp/api"
+	_ "github.com/alkiranet/govpp/binapi/fib_types"
+	_ "github.com/alkiranet/govpp/binapi/ip_types"
+	codec "github.com/alkiranet/govpp/codec"
 )
 
 // This is a compile-time assertion to ensure that this generated file

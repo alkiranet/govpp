@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/pkg/profile"
-	"go.fd.io/govpp/extras/gomemif/memif"
+	"github.com/alkiranet/govpp/extras/gomemif/memif"
 )
 
 func Disconnected(i *memif.Interface) error {
