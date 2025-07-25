@@ -17,16 +17,16 @@ package core
 import (
 	"errors"
 	"fmt"
+	"path"
 	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	logger "github.com/sirupsen/logrus"
-
 	"github.com/alkiranet/govpp/adapter"
 	"github.com/alkiranet/govpp/api"
 	"github.com/alkiranet/govpp/codec"
+	"github.com/alkiranet/govpp/core/genericpool"
 )
 
 const (
@@ -42,9 +42,13 @@ var (
 
 var (
 	HealthCheckProbeInterval = time.Second            // default health check probe interval
-	HealthCheckReplyTimeout  = time.Millisecond * 100 // timeout for reply to a health check probe
-	HealthCheckThreshold     = 1                      // number of failed health checks until the error is reported
-	DefaultReplyTimeout      = time.Second            // default timeout for replies from VPP
+	HealthCheckReplyTimeout  = time.Millisecond * 250 // timeout for reply to a health check probe
+	HealthCheckThreshold     = 2                      // number of failed health checks until the error is reported
+)
+
+var (
+	DefaultReplyTimeout   = time.Duration(0) // default timeout for replies from VPP is disabled
+	WarnSlowReplyDuration = time.Second * 1  // duration of slow replies after which a warning is printed
 )
 
 // ConnectionState represents the current state of the connection to VPP.
@@ -54,7 +58,11 @@ const (
 	// Connected represents state in which the connection has been successfully established.
 	Connected ConnectionState = iota
 
-	// Disconnected represents state in which the connection has been dropped.
+	// NotResponding represents a state where the VPP socket accepts messages but replies are received with delay,
+	// or not at all. GoVPP treats this state internally the same as disconnected.
+	NotResponding
+
+	// Disconnected represents state in which the VPP socket is closed and the connection is considered dropped.
 	Disconnected
 
 	// Failed represents state in which the reconnecting failed after exceeding maximum number of attempts.
@@ -65,6 +73,8 @@ func (s ConnectionState) String() string {
 	switch s {
 	case Connected:
 		return "Connected"
+	case NotResponding:
+		return "NotResponding"
 	case Disconnected:
 		return "Disconnected"
 	case Failed:
@@ -95,13 +105,23 @@ type Connection struct {
 
 	vppConnected uint32 // non-zero if the adapter is connected to VPP
 
-	codec  *codec.MsgCodec        // message codec
-	msgIDs map[string]uint16      // map of message IDs indexed by message name + CRC
-	msgMap map[uint16]api.Message // map of messages indexed by message ID
+	connChan             chan ConnectionEvent // connection status events are sent to this channel
+	healthCheckDone      chan struct{}        // used to terminate connect/health check loop
+	backgroundLoopActive uint32               // used to guard background loop from double close errors
 
-	maxChannelID uint32              // maximum used channel ID (the real limit is 2^15, 32-bit is used for atomic operations)
-	channelsLock sync.RWMutex        // lock for the channels map
-	channels     map[uint16]*Channel // map of all API channels indexed by the channel ID
+	async             bool          // connection to be operated in async mode
+	healthCheckExited chan struct{} // used to notify Disconnect() callers about healthcheck loop exit
+
+	codec  MessageCodec      // message codec
+	msgIDs map[string]uint16 // map of message IDs indexed by message name + CRC
+
+	msgMapByPathLock sync.RWMutex                      // lock for the msgMapByPath map
+	msgMapByPath     map[string]map[uint16]api.Message // map of messages indexed by message ID which are indexed by path
+
+	channelsLock  sync.RWMutex        // lock for the channels map and the channel ID
+	channels      map[uint16]*Channel // map of all API channels indexed by the channel ID
+	channelPool   *genericpool.Pool[*Channel]
+	channelIdPool *idPool
 
 	subscriptionsLock sync.RWMutex                  // lock for the subscriptions map
 	subscriptions     map[uint16][]*subscriptionCtx // map od all notification subscriptions indexed by message ID
@@ -114,9 +134,18 @@ type Connection struct {
 
 	msgControlPing      api.Message
 	msgControlPingReply api.Message
+
+	apiTrace *trace // API tracer (disabled by default)
 }
 
-func newConnection(binapi adapter.VppAPI, attempts int, interval time.Duration) *Connection {
+type backgroundLoopStatus int
+
+const (
+	terminate backgroundLoopStatus = iota
+	resume
+)
+
+func newConnection(binapi adapter.VppAPI, attempts int, interval time.Duration, async bool) *Connection {
 	if attempts == 0 {
 		attempts = DefaultMaxReconnectAttempts
 	}
@@ -128,14 +157,39 @@ func newConnection(binapi adapter.VppAPI, attempts int, interval time.Duration) 
 		vppClient:           binapi,
 		maxAttempts:         attempts,
 		recInterval:         interval,
-		codec:               &codec.MsgCodec{},
+		connChan:            make(chan ConnectionEvent, NotificationChanBufSize),
+		healthCheckDone:     make(chan struct{}),
+		healthCheckExited:   make(chan struct{}),
+		async:               async,
+		codec:               codec.DefaultCodec,
 		msgIDs:              make(map[string]uint16),
-		msgMap:              make(map[uint16]api.Message),
+		msgMapByPath:        make(map[string]map[uint16]api.Message),
 		channels:            make(map[uint16]*Channel),
 		subscriptions:       make(map[uint16][]*subscriptionCtx),
 		msgControlPing:      msgControlPing,
 		msgControlPingReply: msgControlPingReply,
+		apiTrace: &trace{
+			list: make([]*api.Record, 0),
+			mux:  &sync.Mutex{},
+		},
+		channelIdPool: newIDPool(0x7fff),
 	}
+	c.channelPool = genericpool.New[*Channel](func() *Channel {
+		if isDebugOn(debugOptChannels) {
+			log.Debugf("allocating new channel")
+		}
+		// create new channel without ID
+		return &Channel{
+			conn:                c,
+			msgCodec:            c.codec,
+			msgIdentifier:       c,
+			reqChan:             make(chan *vppRequest, RequestChanBufSize),
+			replyChan:           make(chan *vppReply, ReplyChanBufSize),
+			replyTimeout:        DefaultReplyTimeout,
+			receiveReplyTimeout: ReplyChannelTimeout,
+		}
+	})
+
 	binapi.SetMsgCallback(c.msgCallback)
 	return c
 }
@@ -145,7 +199,7 @@ func newConnection(binapi adapter.VppAPI, attempts int, interval time.Duration) 
 // Only one connection attempt will be performed.
 func Connect(binapi adapter.VppAPI) (*Connection, error) {
 	// create new connection handle
-	c := newConnection(binapi, DefaultMaxReconnectAttempts, DefaultReconnectInterval)
+	c := newConnection(binapi, DefaultMaxReconnectAttempts, DefaultReconnectInterval, false)
 
 	// blocking attempt to connect to VPP
 	if err := c.connectVPP(); err != nil {
@@ -160,14 +214,16 @@ func Connect(binapi adapter.VppAPI) (*Connection, error) {
 // returns immediately. The caller is supposed to watch the returned ConnectionState channel for
 // Connected/Disconnected events. In case of disconnect, the library will asynchronously try to reconnect.
 func AsyncConnect(binapi adapter.VppAPI, attempts int, interval time.Duration) (*Connection, chan ConnectionEvent, error) {
+
 	// create new connection handle
-	c := newConnection(binapi, attempts, interval)
+	conn := newConnection(binapi, attempts, interval, true)
+
+	atomic.StoreUint32(&conn.backgroundLoopActive, 1)
 
 	// asynchronously attempt to connect to VPP
-	connChan := make(chan ConnectionEvent, NotificationChanBufSize)
-	go c.connectLoop(connChan)
+	go conn.backgroudConnectionLoop()
 
-	return c, connChan, nil
+	return conn, conn.connChan, nil
 }
 
 // connectVPP performs blocking attempt to connect to VPP.
@@ -198,12 +254,22 @@ func (c *Connection) Disconnect() {
 	if c == nil {
 		return
 	}
+
+	if c.async {
+		if atomic.CompareAndSwapUint32(&c.backgroundLoopActive, 1, 0) {
+			close(c.healthCheckDone)
+		}
+
+		// Wait for the connect/healthcheck loop termination
+		<-c.healthCheckExited
+	}
+
 	if c.vppClient != nil {
 		c.disconnectVPP()
 	}
 }
 
-// disconnectVPP disconnects from VPP in case it is connected.
+// disconnectVPP disconnects from VPP in case it is connected
 func (c *Connection) disconnectVPP() {
 	if atomic.CompareAndSwapUint32(&c.vppConnected, 1, 0) {
 		log.Debug("Disconnecting from VPP..")
@@ -230,14 +296,10 @@ func (c *Connection) newAPIChannel(reqChanBufSize, replyChanBufSize int) (*Chann
 		return nil, errors.New("nil connection passed in")
 	}
 
-	// create new channel
-	chID := uint16(atomic.AddUint32(&c.maxChannelID, 1) & 0x7fff)
-	channel := newChannel(chID, c, c.codec, c, reqChanBufSize, replyChanBufSize)
-
-	// store API channel within the client
-	c.channelsLock.Lock()
-	c.channels[chID] = channel
-	c.channelsLock.Unlock()
+	channel, err := c.newChannel(reqChanBufSize, replyChanBufSize)
+	if err != nil {
+		return nil, err
+	}
 
 	// start watching on the request channel
 	go c.watchRequests(channel)
@@ -247,19 +309,42 @@ func (c *Connection) newAPIChannel(reqChanBufSize, replyChanBufSize int) (*Chann
 
 // releaseAPIChannel releases API channel that needs to be closed.
 func (c *Connection) releaseAPIChannel(ch *Channel) {
-	log.WithFields(logger.Fields{
-		"channel": ch.id,
-	}).Debug("API channel released")
+	l := log.WithField("id", ch.id)
+	if isDebugOn(debugOptChannels) {
+		l.Debug("releasing channel")
+	}
 
 	// delete the channel from channels map
 	c.channelsLock.Lock()
 	delete(c.channels, ch.id)
 	c.channelsLock.Unlock()
+	// return ID to the ID pool
+	c.channelIdPool.Put(ch.id)
+	if isDebugOn(debugOptChannels) {
+		l.Debug("channel ID returned to pool")
+	}
+	// return channel to the pool
+	go c.channelPool.Put(ch)
+}
+
+// runs connectionLoop and healthCheckLoop until they fail
+func (c *Connection) backgroudConnectionLoop() {
+	defer close(c.healthCheckExited)
+
+	for {
+		if c.connectLoop() == terminate {
+			return
+		}
+
+		if c.healthCheckLoop() == terminate {
+			return
+		}
+	}
 }
 
 // connectLoop attempts to connect to VPP until it succeeds.
 // Then it continues with healthCheckLoop.
-func (c *Connection) connectLoop(connChan chan ConnectionEvent) {
+func (c *Connection) connectLoop() backgroundLoopStatus {
 	var reconnectAttempts int
 
 	// loop until connected
@@ -269,31 +354,36 @@ func (c *Connection) connectLoop(connChan chan ConnectionEvent) {
 		}
 		if err := c.connectVPP(); err == nil {
 			// signal connected event
-			connChan <- ConnectionEvent{Timestamp: time.Now(), State: Connected}
-			break
+			c.sendConnEvent(ConnectionEvent{Timestamp: time.Now(), State: Connected})
+			return resume
 		} else if reconnectAttempts < c.maxAttempts {
 			reconnectAttempts++
 			log.Warnf("connecting failed (attempt %d/%d): %v", reconnectAttempts, c.maxAttempts, err)
-			time.Sleep(c.recInterval)
 		} else {
-			connChan <- ConnectionEvent{Timestamp: time.Now(), State: Failed, Error: err}
-			return
+			c.sendConnEvent(ConnectionEvent{Timestamp: time.Now(), State: Failed, Error: err})
+			return terminate
+		}
+
+		select {
+		case <-c.healthCheckDone:
+			// Terminate the connect loop on connection disconnect
+			log.Debug("Disconnected on request, exiting connect loop.")
+			return terminate
+		case <-time.After(c.recInterval):
 		}
 	}
-
-	// we are now connected, continue with health check loop
-	c.healthCheckLoop(connChan)
 }
 
 // healthCheckLoop checks whether connection to VPP is alive. In case of disconnect,
 // it continues with connectLoop and tries to reconnect.
-func (c *Connection) healthCheckLoop(connChan chan ConnectionEvent) {
+func (c *Connection) healthCheckLoop() backgroundLoopStatus {
 	// create a separate API channel for health check probes
 	ch, err := c.newAPIChannel(1, 1)
 	if err != nil {
 		log.Error("Failed to create health check API channel, health check will be disabled:", err)
-		return
+		return terminate
 	}
+	defer ch.Close()
 
 	var (
 		sinceLastReply time.Duration
@@ -301,80 +391,84 @@ func (c *Connection) healthCheckLoop(connChan chan ConnectionEvent) {
 	)
 
 	// send health check probes until an error or timeout occurs
+	probeInterval := time.NewTicker(HealthCheckProbeInterval)
+	defer probeInterval.Stop()
+
+HealthCheck:
 	for {
-		// sleep until next health check probe period
-		time.Sleep(HealthCheckProbeInterval)
-
-		if atomic.LoadUint32(&c.vppConnected) == 0 {
-			// Disconnect has been called in the meantime, return the healthcheck - reconnect loop
-			log.Debug("Disconnected on request, exiting health check loop.")
-			return
-		}
-
-		// try draining probe replies from previous request before sending next one
 		select {
-		case <-ch.replyChan:
-			log.Debug("drained old probe reply from reply channel")
-		default:
-		}
-
-		// send the control ping request
-		ch.reqChan <- &vppRequest{msg: c.msgControlPing}
-
-		for {
-			// expect response within timeout period
+		case <-c.healthCheckDone:
+			// Terminate the health check loop on connection disconnect
+			log.Debug("Disconnected on request, exiting health check loop.")
+			return terminate
+		case <-probeInterval.C:
+			// try draining probe replies from previous request before sending next one
 			select {
-			case vppReply := <-ch.replyChan:
-				err = vppReply.err
-
-			case <-time.After(HealthCheckReplyTimeout):
-				err = ErrProbeTimeout
-
-				// check if time since last reply from any other
-				// channel is less than health check reply timeout
-				c.lastReplyLock.Lock()
-				sinceLastReply = time.Since(c.lastReply)
-				c.lastReplyLock.Unlock()
-
-				if sinceLastReply < HealthCheckReplyTimeout {
-					log.Warnf("VPP health check probe timing out, but some request on other channel was received %v ago, continue waiting!", sinceLastReply)
-					continue
-				}
+			case <-ch.replyChan:
+				log.Debug("drained old probe reply from reply channel")
+			default:
 			}
-			break
-		}
 
-		if err == ErrProbeTimeout {
-			failedChecks++
-			log.Warnf("VPP health check probe timed out after %v (%d. timeout)", HealthCheckReplyTimeout, failedChecks)
-			if failedChecks > HealthCheckThreshold {
-				// in case of exceeded failed check treshold, assume VPP disconnected
-				log.Errorf("VPP health check exceeded treshold for timeouts (>%d), assuming disconnect", HealthCheckThreshold)
-				connChan <- ConnectionEvent{Timestamp: time.Now(), State: Disconnected}
+			// send the control ping request
+			ch.reqChan <- &vppRequest{msg: c.msgControlPing}
+
+			for {
+				// expect response within timeout period
+				select {
+				case vppReply := <-ch.replyChan:
+					err = vppReply.err
+
+				case <-time.After(HealthCheckReplyTimeout):
+					err = ErrProbeTimeout
+
+					// check if time since last reply from any other
+					// channel is less than health check reply timeout
+					c.lastReplyLock.Lock()
+					sinceLastReply = time.Since(c.lastReply)
+					c.lastReplyLock.Unlock()
+
+					if sinceLastReply < HealthCheckReplyTimeout {
+						log.Warnf("VPP health check probe timing out, but some request on other channel was received %v ago, continue waiting!", sinceLastReply)
+						continue
+					}
+				}
 				break
 			}
-		} else if err != nil {
-			// in case of error, assume VPP disconnected
-			log.Errorf("VPP health check probe failed: %v", err)
-			connChan <- ConnectionEvent{Timestamp: time.Now(), State: Disconnected, Error: err}
-			break
-		} else if failedChecks > 0 {
-			// in case of success after failed checks, clear failed check counter
-			failedChecks = 0
-			log.Infof("VPP health check probe OK")
+
+			if err == ErrProbeTimeout {
+				failedChecks++
+				log.Warnf("VPP health check probe timed out after %v (%d. timeout)", HealthCheckReplyTimeout, failedChecks)
+				if failedChecks > HealthCheckThreshold {
+					// in case of exceeded failed check threshold, assume VPP unresponsive
+					log.Errorf("VPP does not responding, the health check exceeded threshold for timeouts (>%d)", HealthCheckThreshold)
+					c.sendConnEvent(ConnectionEvent{Timestamp: time.Now(), State: NotResponding})
+					break HealthCheck
+				}
+			} else if err != nil {
+				// in case of error, assume VPP disconnected
+				log.Errorf("VPP health check probe failed: %v", err)
+				c.sendConnEvent(ConnectionEvent{Timestamp: time.Now(), State: Disconnected, Error: err})
+				break HealthCheck
+			} else if failedChecks > 0 {
+				// in case of success after failed checks, clear failed check counter
+				failedChecks = 0
+				log.Infof("VPP health check probe OK")
+			}
 		}
 	}
 
 	// cleanup
-	ch.Close()
 	c.disconnectVPP()
 
-	// we are now disconnected, start connect loop
-	c.connectLoop(connChan)
+	return resume
 }
 
 func getMsgNameWithCrc(x api.Message) string {
-	return x.GetMessageName() + "_" + x.GetCrcString()
+	return getMsgID(x.GetMessageName(), x.GetCrcString())
+}
+
+func getMsgID(name, crc string) string {
+	return name + "_" + crc
 }
 
 func getMsgFactory(msg api.Message) func() api.Message {
@@ -388,63 +482,125 @@ func (c *Connection) GetMessageID(msg api.Message) (uint16, error) {
 	if c == nil {
 		return 0, errors.New("nil connection passed in")
 	}
-
-	if msgID, ok := c.msgIDs[getMsgNameWithCrc(msg)]; ok {
-		return msgID, nil
-	}
-
+	pkgPath := c.GetMessagePath(msg)
 	msgID, err := c.vppClient.GetMsgID(msg.GetMessageName(), msg.GetCrcString())
 	if err != nil {
 		return 0, err
 	}
+	func() {
+		c.msgMapByPathLock.Lock()
+		defer c.msgMapByPathLock.Unlock()
 
+		if pathMsgs, pathOk := c.msgMapByPath[pkgPath]; !pathOk {
+			c.msgMapByPath[pkgPath] = make(map[uint16]api.Message)
+			c.msgMapByPath[pkgPath][msgID] = msg
+		} else if _, msgOk := pathMsgs[msgID]; !msgOk {
+			c.msgMapByPath[pkgPath][msgID] = msg
+		}
+	}()
+	if _, ok := c.msgIDs[getMsgNameWithCrc(msg)]; ok {
+		return msgID, nil
+	}
 	c.msgIDs[getMsgNameWithCrc(msg)] = msgID
-	c.msgMap[msgID] = msg
-
 	return msgID, nil
 }
 
 // LookupByID looks up message name and crc by ID.
-func (c *Connection) LookupByID(msgID uint16) (api.Message, error) {
+func (c *Connection) LookupByID(path string, msgID uint16) (api.Message, error) {
 	if c == nil {
 		return nil, errors.New("nil connection passed in")
 	}
-
-	if msg, ok := c.msgMap[msgID]; ok {
+	c.msgMapByPathLock.RLock()
+	defer c.msgMapByPathLock.RUnlock()
+	if msg, ok := c.msgMapByPath[path][msgID]; ok {
 		return msg, nil
 	}
+	return nil, fmt.Errorf("unknown message ID %d for path '%s'", msgID, path)
+}
 
-	return nil, fmt.Errorf("unknown message ID: %d", msgID)
+// GetMessagePath returns path for the given message
+func (c *Connection) GetMessagePath(msg api.Message) string {
+	return path.Dir(reflect.TypeOf(msg).Elem().PkgPath())
 }
 
 // retrieveMessageIDs retrieves IDs for all registered messages and stores them in map
 func (c *Connection) retrieveMessageIDs() (err error) {
+	msgsByPath := api.GetRegisteredMessages()
+
 	t := time.Now()
-
-	msgs := api.GetRegisteredMessages()
-
+	debugMsgIDs := isDebugOn(debugOptMsgId)
+	if debugMsgIDs {
+		log.Debugf("start retrieving message IDs for %d pkg paths", len(msgsByPath))
+	}
 	var n int
-	for name, msg := range msgs {
-		msgID, err := c.GetMessageID(msg)
-		if err != nil {
-			log.Debugf("retrieving msgID for %s failed: %v", name, err)
-			continue
-		}
-		n++
-
-		if c.pingReqID == 0 && msg.GetMessageName() == c.msgControlPing.GetMessageName() {
-			c.pingReqID = msgID
-			c.msgControlPing = reflect.New(reflect.TypeOf(msg).Elem()).Interface().(api.Message)
-		} else if c.pingReplyID == 0 && msg.GetMessageName() == c.msgControlPingReply.GetMessageName() {
-			c.pingReplyID = msgID
-			c.msgControlPingReply = reflect.New(reflect.TypeOf(msg).Elem()).Interface().(api.Message)
-		}
-
+	for pkgPath, msgs := range msgsByPath {
+		l := log.WithField("pkgPath", pkgPath)
 		if debugMsgIDs {
-			log.Debugf("message %q (%s) has ID: %d", name, getMsgNameWithCrc(msg), msgID)
+			l.Debugf("retrieving IDs for %d messages", len(msgs))
+		}
+		tt := time.Now()
+		var nn int
+		for _, msg := range msgs {
+			msgID, err := c.GetMessageID(msg)
+			if err != nil {
+				if debugMsgIDs {
+					l.Warnf("failed to retrieve message ID for %s: %v", msg.GetMessageName(), err)
+				}
+				continue
+			}
+			n++
+			nn++
+
+			if c.pingReqID == 0 && msg.GetMessageName() == c.msgControlPing.GetMessageName() {
+				c.pingReqID = msgID
+				c.msgControlPing = reflect.New(reflect.TypeOf(msg).Elem()).Interface().(api.Message)
+			} else if c.pingReplyID == 0 && msg.GetMessageName() == c.msgControlPingReply.GetMessageName() {
+				c.pingReplyID = msgID
+				c.msgControlPingReply = reflect.New(reflect.TypeOf(msg).Elem()).Interface().(api.Message)
+			}
+
+			if debugMsgIDs {
+				l.Debugf(" - #%d message %q (%s) has ID: %d", n, msg.GetMessageName(), getMsgNameWithCrc(msg), msgID)
+			}
+		}
+		if debugMsgIDs {
+			l.WithField("took", time.Since(tt)).
+				Debugf("retrieved IDs for %d/%d messages", nn, len(msgs))
 		}
 	}
-	log.Debugf("retrieved %d/%d msgIDs (took %s)", n, len(msgs), time.Since(t))
+	if debugMsgIDs {
+		log.WithField("took", time.Since(t)).
+			Debugf("done retrieving IDs for %d messages", n)
+	}
 
 	return nil
+}
+
+func (c *Connection) sendConnEvent(event ConnectionEvent) {
+	select {
+	case c.connChan <- event:
+	default:
+		log.Warn("Connection state channel is full, discarding value.")
+	}
+}
+
+// Trace gives access to the API trace interface
+func (c *Connection) Trace() api.Trace {
+	return c.apiTrace
+}
+
+// trace records api message
+func (c *Connection) trace(msg api.Message, chId uint16, t time.Time, isReceived bool) {
+	if atomic.LoadInt32(&c.apiTrace.isEnabled) == 0 {
+		return
+	}
+	entry := &api.Record{
+		Message:    msg,
+		Timestamp:  t,
+		IsReceived: isReceived,
+		ChannelID:  chId,
+	}
+	c.apiTrace.mux.Lock()
+	c.apiTrace.list = append(c.apiTrace.list, entry)
+	c.apiTrace.mux.Unlock()
 }

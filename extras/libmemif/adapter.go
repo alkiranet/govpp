@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows && !darwin
 // +build !windows,!darwin
 
 package libmemif
@@ -50,7 +51,7 @@ memif_cancel_poll_event ()
 // are much easier to work with in cgo.
 typedef struct
 {
-	char *socket_filename;
+	memif_socket_handle_t socket;
 	char *secret;
 	uint8_t num_s2m_rings;
 	uint8_t num_m2s_rings;
@@ -74,7 +75,7 @@ typedef struct
 	char *secret;
 	uint8_t role;
 	uint8_t mode;
-	char *socket_filename;
+	char *socket_path;
 	uint8_t regions_num;
 	memif_region_details_t *regions;
 	uint8_t rx_queues_num;
@@ -83,6 +84,7 @@ typedef struct
 	memif_queue_details_t *tx_queues;
 	uint8_t link_up_down;
 } govpp_memif_details_t;
+
 
 extern int go_on_connect_callback(void *privateCtx);
 extern int go_on_disconnect_callback(void *privateCtx);
@@ -108,7 +110,7 @@ govpp_memif_create (memif_conn_handle_t *conn, govpp_memif_conn_args_t *go_args,
 {
 	memif_conn_args_t args;
 	memset (&args, 0, sizeof (args));
-	args.socket_filename = (char *)go_args->socket_filename;
+	args.socket = (char *)go_args->socket;
 	if (go_args->secret != NULL)
 	{
 		strncpy ((char *)args.secret, go_args->secret,
@@ -130,6 +132,12 @@ govpp_memif_create (memif_conn_handle_t *conn, govpp_memif_conn_args_t *go_args,
 	return memif_create(conn, &args, govpp_on_connect_callback,
 						govpp_on_disconnect_callback, NULL,
 						private_ctx);
+}
+
+static int
+govpp_memif_create_socket (memif_socket_handle_t *sock, memif_socket_args_t *args)
+{
+	return memif_create_socket(sock, args, NULL);
 }
 
 // govpp_memif_get_details keeps reallocating buffer until it is large enough.
@@ -168,7 +176,7 @@ govpp_memif_get_details (memif_conn_handle_t conn, govpp_memif_details_t *govpp_
 		govpp_md->secret = (char *)md.secret;
 		govpp_md->role = md.role;
 		govpp_md->mode = md.mode;
-		govpp_md->socket_filename = (char *)md.socket_filename;
+		govpp_md->socket_path = (char *)md.socket_path;
 		govpp_md->regions_num = md.regions_num;
 		govpp_md->regions = md.regions;
 		govpp_md->rx_queues_num = md.rx_queues_num;
@@ -308,6 +316,8 @@ type MemifMeta struct {
 
 	// Mode is the mode (layer/behaviour) in which the memif operates.
 	Mode IfMode
+
+	AppName string
 }
 
 // MemifShmSpecs is used to store the specification of the shared memory segment
@@ -365,14 +375,16 @@ type Memif struct {
 	MemifMeta
 
 	// Per-library references
-	ifIndex int                   // index used in the Go-libmemif context (Context.memifs)
-	cHandle C.memif_conn_handle_t // handle used in C-libmemif
+	ifIndex int                     // index used in the Go-libmemif context (Context.memifs)
+	cHandle C.memif_conn_handle_t   // connection handle used in C-libmemif
+	sHandle C.memif_socket_handle_t // socket handle used in C-libmemif
 
 	// Callbacks
 	callbacks *MemifCallbacks
 
 	// Interrupt
 	intCh      chan uint8      // memif-global interrupt channel (value = queue ID)
+	intErrCh   chan error      // triggered when interrupt error occurs
 	queueIntCh []chan struct{} // per RX queue interrupt channel
 
 	// Rx/Tx queues
@@ -439,12 +451,24 @@ type txPacketBuffer struct {
 	size    int
 }
 
+type MemifSocketArgs struct {
+	Path    string
+	AppName string
+
+	OnControlFdUpdate *C.memif_control_fd_update_t
+	Alloc             *C.memif_alloc_t
+	Realloc           *C.memif_realloc_t
+	Free              *C.memif_free_t
+}
+
 var (
 	// logger used by the adapter.
 	log *logger.Logger
 
 	// Global Go-libmemif context.
 	context = &Context{initialized: false}
+
+	socketHandler C.memif_socket_handle_t
 )
 
 // init initializes global logger, which logs debug level messages to stdout.
@@ -475,16 +499,7 @@ func Init(appName string) error {
 
 	log.Debug("Initializing libmemif library")
 
-	// Initialize C-libmemif.
-	var errCode int
-	if appName == "" {
-		errCode = int(C.memif_init(nil, nil, nil, nil, nil))
-	} else {
-		appName := C.CString(appName)
-		defer C.free(unsafe.Pointer(appName))
-		errCode = int(C.memif_init(nil, appName, nil, nil, nil))
-	}
-	err := getMemifError(errCode)
+	err := getMemifError(0)
 	if err != nil {
 		return err
 	}
@@ -494,7 +509,7 @@ func Init(appName string) error {
 
 	// Start event polling.
 	context.wg.Add(1)
-	go pollEvents()
+	go pollEvents(&socketHandler, C.int(-1))
 
 	context.initialized = true
 	log.Debug("libmemif library was initialized")
@@ -518,8 +533,9 @@ func Cleanup() error {
 	}
 
 	// Stop the event loop (if supported by C-libmemif).
-	errCode := C.memif_cancel_poll_event()
+	errCode := C.memif_cancel_poll_event(socketHandler)
 	err := getMemifError(int(errCode))
+
 	if err == nil {
 		log.Debug("Waiting for pollEvents() to stop...")
 		context.wg.Wait()
@@ -529,11 +545,12 @@ func Cleanup() error {
 	}
 
 	// Run cleanup for C-libmemif.
-	err = getMemifError(int(C.memif_cleanup()))
+	err = getMemifError(int(C.memif_delete_socket(&socketHandler)))
 	if err == nil {
 		context.initialized = false
 		log.Debug("libmemif library was closed")
 	}
+
 	return err
 }
 
@@ -578,6 +595,7 @@ func CreateInterface(config *MemifConfig, callbacks *MemifCallbacks) (memif *Mem
 
 	// Initialize memif-global interrupt channel.
 	memif.intCh = make(chan uint8, 1<<6)
+	memif.intErrCh = make(chan error, 1<<6)
 
 	// Initialize event file descriptor for stopping Rx/Tx queue polling.
 	memif.stopQPollFd = int(C.eventfd(0, C.EFD_NONBLOCK))
@@ -587,11 +605,34 @@ func CreateInterface(config *MemifConfig, callbacks *MemifCallbacks) (memif *Mem
 
 	// Initialize memif input arguments.
 	args := &C.govpp_memif_conn_args_t{}
+	sockargs := &C.memif_socket_args_t{}
+
+	C.strncpy((*C.char)(unsafe.Pointer(&sockargs.path)), C.CString(config.MemifMeta.SocketFilename), C.strlen(C.CString(config.MemifMeta.SocketFilename)))
+	C.strncpy((*C.char)(unsafe.Pointer(&sockargs.app_name)), C.CString(config.MemifMeta.AppName), C.strlen(C.CString(config.MemifMeta.AppName)))
+
+	if !config.IsMaster {
+		sockargs.connection_request_timer.it_value.tv_sec = 2
+		sockargs.connection_request_timer.it_value.tv_nsec = 0
+		sockargs.connection_request_timer.it_interval.tv_sec = 2
+		sockargs.connection_request_timer.it_interval.tv_nsec = 0
+	}
+	/*
+		sockargs.connection_request_timer.it_value.tv_sec = 2
+		sockargs.connection_request_timer.it_value.tv_nsec = 0
+		sockargs.connection_request_timer.it_interval.tv_sec = 2
+		sockargs.connection_request_timer.it_interval.tv_nsec = 0
+	*/
 	// - socket file name
 	if config.SocketFilename != "" {
-		args.socket_filename = C.CString(config.SocketFilename)
-		defer C.free(unsafe.Pointer(args.socket_filename))
+		log.WithField("name", config.SocketFilename).Debug("A new memif socket was created")
+		//errCode := C.govpp_memif_create_socket(&memif.sHandle, sockargs)
+		errCode := C.govpp_memif_create_socket(&socketHandler, sockargs)
+		if getMemifError(int(errCode)) != nil {
+			err = getMemifError(int(errCode))
+			return nil, err
+		}
 	}
+	args.socket = socketHandler
 	// - interface ID
 	args.interface_id = C.uint32_t(config.ConnID)
 	// - interface name
@@ -632,8 +673,8 @@ func CreateInterface(config *MemifConfig, callbacks *MemifCallbacks) (memif *Mem
 
 	// Create memif in C-libmemif.
 	errCode := C.govpp_memif_create(&memif.cHandle, args, unsafe.Pointer(uintptr(memif.ifIndex)))
-	err = getMemifError(int(errCode))
-	if err != nil {
+	if getMemifError(int(errCode)) != nil {
+		err = getMemifError(int(errCode))
 		return nil, err
 	}
 
@@ -655,6 +696,12 @@ func CreateInterface(config *MemifConfig, callbacks *MemifCallbacks) (memif *Mem
 // The method is thread-safe.
 func (memif *Memif) GetInterruptChan() (ch <-chan uint8 /* queue ID */) {
 	return memif.intCh
+}
+
+// GetInterruptErrorChan returns an Error channel
+// which fires if there are errors occurred while read data.
+func (memif *Memif) GetInterruptErrorChan() (ch <-chan error /* The error */) {
+	return memif.intErrCh
 }
 
 // GetQueueInterruptChan returns an empty-data channel which fires every time
@@ -711,7 +758,7 @@ func (memif *Memif) GetDetails() (details *MemifDetails, err error) {
 	details.IfName = C.GoString(cDetails.if_name)
 	details.InstanceName = C.GoString(cDetails.inst_name)
 	details.ConnID = uint32(cDetails.id)
-	details.SocketFilename = C.GoString(cDetails.socket_filename)
+	details.SocketFilename = C.GoString(cDetails.socket_path)
 	if cDetails.secret != nil {
 		details.Secret = C.GoString(cDetails.secret)
 	}
@@ -771,7 +818,7 @@ func (memif *Memif) TxBurst(queueID uint8, packets []RawPacketData) (count uint1
 	}
 
 	var bufCount int
-	var buffers []*txPacketBuffer
+	buffers := make([]*txPacketBuffer, 0)
 	cQueueID := C.uint16_t(queueID)
 
 	for _, packet := range packets {
@@ -916,6 +963,7 @@ func (memif *Memif) TxBurst(queueID uint8, packets []RawPacketData) (count uint1
 // Rx queue.
 func (memif *Memif) RxBurst(queueID uint8, count uint16) (packets []RawPacketData, err error) {
 	var recvCount C.uint16_t
+	packets = make([]RawPacketData, 0)
 
 	if count == 0 {
 		return packets, nil
@@ -1011,6 +1059,7 @@ func (memif *Memif) Close() error {
 	if err != nil {
 		// Close memif-global interrupt channel.
 		close(memif.intCh)
+		close(memif.intErrCh)
 		// Close file descriptor stopQPollFd.
 		C.close(C.int(memif.stopQPollFd))
 	}
@@ -1089,10 +1138,10 @@ func (memif *Memif) closeQueues() {
 }
 
 // pollEvents repeatedly polls for a libmemif event.
-func pollEvents() {
+func pollEvents(sock *C.memif_socket_handle_t, timeout C.int) {
 	defer context.wg.Done()
 	for {
-		errCode := C.memif_poll_event(C.int(-1))
+		errCode := C.memif_poll_event(*sock, timeout)
 		err := getMemifError(int(errCode))
 		if err == ErrPollCanceled {
 			return
@@ -1146,7 +1195,13 @@ func pollRxQueue(memif *Memif, queueID uint8) {
 	for {
 		_, err := syscall.EpollWait(epFd, event[:], -1)
 		if err != nil {
+			errno, _ := err.(syscall.Errno)
+			//EINTR and EAGAIN should not be considered as a fatal error, try again
+			if errno == syscall.EINTR || errno == syscall.EAGAIN {
+				continue
+			}
 			log.WithField("err", err).Error("epoll_wait() failed")
+			memif.intErrCh <- err
 			return
 		}
 

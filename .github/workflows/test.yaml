@@ -1,0 +1,42 @@
+---
+name: Test
+on:
+  # Runs on branch push to master & PRs
+  push:
+    branches:
+      - master
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  # Runs daily at 05:05
+  schedule:
+    - cron: '5 5 * * *'
+  # Allows running manually
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: "VPP Integration ${{ matrix.version }}"
+    runs-on: ubuntu-latest
+    env:
+      VPP_REPO: ${{ matrix.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - 'master'
+          - '2306'
+          - '2302'
+          - '2210'
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v3
+      - name: "Setup Go"
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.20'
+      - name: "Run Tests"
+        run: |
+          make test-integration

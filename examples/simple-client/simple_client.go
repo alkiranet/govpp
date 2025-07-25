@@ -17,21 +17,21 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"strings"
 
 	"github.com/alkiranet/govpp"
 	"github.com/alkiranet/govpp/adapter/socketclient"
 	"github.com/alkiranet/govpp/api"
+	interfaces "github.com/alkiranet/govpp/binapi/interface"
+	"github.com/alkiranet/govpp/binapi/interface_types"
+	"github.com/alkiranet/govpp/binapi/ip"
+	"github.com/alkiranet/govpp/binapi/ip_types"
+	"github.com/alkiranet/govpp/binapi/vpe"
 	"github.com/alkiranet/govpp/core"
-	"github.com/alkiranet/govpp/examples/binapi/interface_types"
-	"github.com/alkiranet/govpp/examples/binapi/interfaces"
-	"github.com/alkiranet/govpp/examples/binapi/ip"
-	"github.com/alkiranet/govpp/examples/binapi/ip_types"
-	"github.com/alkiranet/govpp/examples/binapi/vpe"
 )
 
 var (
@@ -42,62 +42,56 @@ func main() {
 	flag.Parse()
 
 	fmt.Println("Starting simple client example")
+	fmt.Println()
 
 	// connect to VPP asynchronously
-	conn, conev, err := govpp.AsyncConnect(*sockAddr, core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
+	conn, connEv, err := govpp.AsyncConnect(*sockAddr, core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
 	if err != nil {
 		log.Fatalln("ERROR:", err)
 	}
 	defer conn.Disconnect()
 
 	// wait for Connected event
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			log.Fatalln("ERROR: connecting to VPP failed:", e.Error)
-		}
+	e := <-connEv
+	if e.State != core.Connected {
+		log.Fatalln("ERROR: connecting to VPP failed:", e.Error)
 	}
 
-	// create an API channel that will be used in the examples
+	// check compatibility of used messages
 	ch, err := conn.NewAPIChannel()
 	if err != nil {
 		log.Fatalln("ERROR: creating channel failed:", err)
 	}
 	defer ch.Close()
-
-	vppVersion(ch)
-
+	if err := ch.CheckCompatiblity(vpe.AllMessages()...); err != nil {
+		log.Fatalf("compatibility check failed: %v", err)
+	}
 	if err := ch.CheckCompatiblity(interfaces.AllMessages()...); err != nil {
-		log.Fatal(err)
+		log.Printf("compatibility check failed: %v", err)
 	}
 
-	createLoopback(ch)
-	createLoopback(ch)
+	// process errors encountered during the example
+	defer func() {
+		if len(errors) > 0 {
+			fmt.Printf("finished with %d errors\n", len(errors))
+			os.Exit(1)
+		} else {
+			fmt.Println("finished successfully")
+		}
+	}()
+
+	// use request/reply (channel API)
+	getVppVersion(ch)
+	getSystemTime(ch)
+	idx := createLoopback(ch)
 	interfaceDump(ch)
-
-	addIPAddress(ch)
-	ipAddressDump(ch)
-
-	interfaceNotifications(ch)
-
-	if len(Errors) > 0 {
-		fmt.Printf("finished with %d errors\n", len(Errors))
-		os.Exit(1)
-	} else {
-		fmt.Println("finished successfully")
-	}
+	addIPAddress(ch, idx)
+	ipAddressDump(ch, idx)
+	interfaceNotifications(ch, idx)
 }
 
-var Errors []error
-
-func logError(err error, msg string) {
-	fmt.Printf("ERROR: %s: %v\n", msg, err)
-	Errors = append(Errors, err)
-}
-
-// vppVersion is the simplest API example - it retrieves VPP version.
-func vppVersion(ch api.Channel) {
-	fmt.Println("Retrieving version")
+func getVppVersion(ch api.Channel) {
+	fmt.Println("Retrieving version..")
 
 	req := &vpe.ShowVersion{}
 	reply := &vpe.ShowVersionReply{}
@@ -106,81 +100,103 @@ func vppVersion(ch api.Channel) {
 		logError(err, "retrieving version")
 		return
 	}
-	fmt.Printf("reply: %+v\n", reply)
 
-	fmt.Printf("VPP version: %q\n", cleanString(reply.Version))
-	fmt.Println("ok")
+	fmt.Printf("VPP version: %q\n", reply.Version)
+	fmt.Println("OK")
+	fmt.Println()
 }
 
-// createLoopback sends request to create loopback interface.
-func createLoopback(ch api.Channel) {
-	fmt.Println("Creating loopback interface")
+func getSystemTime(ch api.Channel) {
+	fmt.Println("Retrieving system time..")
+
+	req := &vpe.ShowVpeSystemTime{}
+	reply := &vpe.ShowVpeSystemTimeReply{}
+
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		logError(err, "retrieving system time")
+		return
+	}
+
+	fmt.Printf("system time: %v\n", reply.VpeSystemTime)
+	fmt.Println("OK")
+	fmt.Println()
+}
+
+func createLoopback(ch api.Channel) interface_types.InterfaceIndex {
+	fmt.Println("Creating loopback interface..")
 
 	req := &interfaces.CreateLoopback{}
 	reply := &interfaces.CreateLoopbackReply{}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 		logError(err, "creating loopback interface")
-		return
+		return 0
 	}
-	fmt.Printf("reply: %+v\n", reply)
 
-	fmt.Printf("loopback interface index: %v\n", reply.SwIfIndex)
+	fmt.Printf("interface index: %v\n", reply.SwIfIndex)
 	fmt.Println("OK")
+	fmt.Println()
+
+	return reply.SwIfIndex
 }
 
-// interfaceDump shows an example of multipart request (multiple replies are expected).
 func interfaceDump(ch api.Channel) {
-	fmt.Println("Dumping interfaces")
+	fmt.Println("Dumping interfaces..")
 
-	reqCtx := ch.SendMultiRequest(&interfaces.SwInterfaceDump{})
+	n := 0
+	reqCtx := ch.SendMultiRequest(&interfaces.SwInterfaceDump{
+		SwIfIndex: ^interface_types.InterfaceIndex(0),
+	})
 	for {
 		msg := &interfaces.SwInterfaceDetails{}
 		stop, err := reqCtx.ReceiveReply(msg)
+		if stop {
+			break
+		}
 		if err != nil {
 			logError(err, "dumping interfaces")
 			return
 		}
-		if stop {
-			break
-		}
-		fmt.Printf(" - interface: %+v\n", msg)
+		n++
+		fmt.Printf(" - interface #%d: %+v\n", n, msg)
+		marshal(msg)
 	}
 
 	fmt.Println("OK")
+	fmt.Println()
 }
 
-// addIPAddress sends request to add IP address to interface.
-func addIPAddress(ch api.Channel) {
-	fmt.Println("Adding IP address to interface")
+func addIPAddress(ch api.Channel, index interface_types.InterfaceIndex) {
+	fmt.Printf("Adding IP address to interface index %d\n", index)
 
 	req := &interfaces.SwInterfaceAddDelAddress{
-		SwIfIndex: 1,
+		SwIfIndex: index,
 		IsAdd:     true,
 		Prefix: ip_types.AddressWithPrefix{
-			Address: interfaces.Address{
+			Address: ip_types.Address{
 				Af: ip_types.ADDRESS_IP4,
-				Un: ip_types.AddressUnionIP4(interfaces.IP4Address{10, 10, 0, 1}),
+				Un: ip_types.AddressUnionIP4(ip_types.IP4Address{10, 10, 0, uint8(index)}),
 			},
-			Len: 24,
+			Len: 32,
 		},
 	}
+	marshal(req)
 	reply := &interfaces.SwInterfaceAddDelAddressReply{}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 		logError(err, "adding IP address to interface")
 		return
 	}
-	fmt.Printf("reply: %+v\n", reply)
 
 	fmt.Println("OK")
+	fmt.Println()
 }
 
-func ipAddressDump(ch api.Channel) {
-	fmt.Println("Dumping IP addresses")
+func ipAddressDump(ch api.Channel, index interface_types.InterfaceIndex) {
+	fmt.Printf("Dumping IP addresses for interface index %d..\n", index)
 
 	req := &ip.IPAddressDump{
-		SwIfIndex: 1,
+		SwIfIndex: index,
 	}
 	reqCtx := ch.SendMultiRequest(req)
 
@@ -195,16 +211,18 @@ func ipAddressDump(ch api.Channel) {
 			break
 		}
 		fmt.Printf(" - ip address: %+v\n", msg)
+		marshal(msg)
 	}
 
 	fmt.Println("OK")
+	fmt.Println()
 }
 
 // interfaceNotifications shows the usage of notification API. Note that for notifications,
 // you are supposed to create your own Go channel with your preferred buffer size. If the channel's
 // buffer is full, the notifications will not be delivered into it.
-func interfaceNotifications(ch api.Channel) {
-	fmt.Println("Subscribing to notificaiton events")
+func interfaceNotifications(ch api.Channel, index interface_types.InterfaceIndex) {
+	fmt.Printf("Subscribing to notificaiton events for interface index %d\n", index)
 
 	notifChan := make(chan api.Message, 100)
 
@@ -225,26 +243,32 @@ func interfaceNotifications(ch api.Channel) {
 		return
 	}
 
+	// receive notifications
+	go func() {
+		for notif := range notifChan {
+			e := notif.(*interfaces.SwInterfaceEvent)
+			fmt.Printf("incoming event: %+v\n", e)
+			marshal(e)
+		}
+	}()
+
 	// generate some events in VPP
 	err = ch.SendRequest(&interfaces.SwInterfaceSetFlags{
-		SwIfIndex: 1,
-	}).ReceiveReply(&interfaces.SwInterfaceSetFlagsReply{})
-	if err != nil {
-		logError(err, "setting interface flags")
-		return
-	}
-	err = ch.SendRequest(&interfaces.SwInterfaceSetFlags{
-		SwIfIndex: 1,
+		SwIfIndex: index,
 		Flags:     interface_types.IF_STATUS_API_FLAG_ADMIN_UP,
 	}).ReceiveReply(&interfaces.SwInterfaceSetFlagsReply{})
 	if err != nil {
 		logError(err, "setting interface flags")
 		return
 	}
-
-	// receive one notification
-	notif := (<-notifChan).(*interfaces.SwInterfaceEvent)
-	fmt.Printf("incoming event: %+v\n", notif)
+	err = ch.SendRequest(&interfaces.SwInterfaceSetFlags{
+		SwIfIndex: index,
+		Flags:     0,
+	}).ReceiveReply(&interfaces.SwInterfaceSetFlagsReply{})
+	if err != nil {
+		logError(err, "setting interface flags")
+		return
+	}
 
 	// disable interface events in VPP
 	err = ch.SendRequest(&interfaces.WantInterfaceEvents{
@@ -263,9 +287,22 @@ func interfaceNotifications(ch api.Channel) {
 		return
 	}
 
+	fmt.Println("OK")
 	fmt.Println()
 }
 
-func cleanString(str string) string {
-	return strings.Split(str, "\x00")[0]
+func marshal(v interface{}) {
+	fmt.Printf("GO: %#v\n", v)
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("JSON: %s\n", b)
+}
+
+var errors []error
+
+func logError(err error, msg string) {
+	fmt.Printf("ERROR: %s: %v\n", msg, err)
+	errors = append(errors, err)
 }
