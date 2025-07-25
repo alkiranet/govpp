@@ -223,6 +223,10 @@ func (c *StatsConnection) GetSystemStats(sysStats *api.SystemStats) (err error) 
 
 // GetErrorStats retrieves VPP error stats.
 func (c *StatsConnection) GetErrorStats(errorStats *api.ErrorStats) (err error) {
+	//AK-58254: reset the errorStatsData dir to ensure cached values are not used
+	// in every collect call.
+	c.errorStatsData = nil
+
 	if err := c.updateStats(&c.errorStatsData, CounterStatsPrefix); err != nil {
 		return err
 	}
