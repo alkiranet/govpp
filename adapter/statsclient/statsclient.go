@@ -18,9 +18,17 @@ package statsclient
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
+	"github.com/ftrvxmtrx/fd"
 	logger "github.com/sirupsen/logrus"
 
 	"github.com/alkiranet/govpp/adapter"
@@ -29,21 +37,14 @@ import (
 const (
 	// DefaultSocketName is default VPP stats socket file path.
 	DefaultSocketName = adapter.DefaultStatsSocket
+
+	// DefaultSocketRetryPeriod is the time period after the socket availability
+	// will be re-checked
+	DefaultSocketRetryPeriod = 50 * time.Millisecond
+
+	// DefaultSocketRetryTimeout is the maximum time for the stats socket
+	DefaultSocketRetryTimeout = 3 * time.Second
 )
-
-const socketMissing = `
-------------------------------------------------------------
- VPP stats socket file %s is missing!
-
-  - is VPP running with stats segment enabled?
-  - is the correct socket name configured?
-
- To enable it add following section to your VPP config:
-   statseg {
-     default
-   }
-------------------------------------------------------------
-`
 
 var (
 	// Debug is global variable that determines debug mode
@@ -73,184 +74,504 @@ var _ adapter.StatsAPI = (*StatsClient)(nil)
 
 // StatsClient is the pure Go implementation for VPP stats API.
 type StatsClient struct {
-	sockAddr string
+	socket       string
+	retryPeriod  time.Duration
+	retryTimeout time.Duration
+
+	headerData []byte
+
+	// defines the adapter connection state
+	connected uint32
+	// defines the adapter monitoring loop state
+	monitored uint32
+
+	// to quit socket monitor
+	done chan struct{}
+
+	// to protect statseg access from concurrent reconnect
+	accessLock sync.RWMutex
 
 	statSegment
 }
 
-// NewStatsClient returns new VPP stats API client.
-func NewStatsClient(sockAddr string) *StatsClient {
-	if sockAddr == "" {
-		sockAddr = DefaultSocketName
-	}
-	return &StatsClient{
-		sockAddr: sockAddr,
+// Option is a StatsClient option
+type Option func(*StatsClient)
+
+// SetSocketRetryPeriod is and optional parameter to define a custom
+// retry period while waiting for the VPP socket
+func SetSocketRetryPeriod(t time.Duration) Option {
+	return func(c *StatsClient) {
+		c.retryPeriod = t
 	}
 }
 
-func (c *StatsClient) Connect() error {
-	// check if socket exists
-	if _, err := os.Stat(c.sockAddr); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, socketMissing, c.sockAddr)
-		return fmt.Errorf("stats socket file %s does not exist", c.sockAddr)
-	} else if err != nil {
-		return fmt.Errorf("stats socket error: %v", err)
+// SetSocketRetryTimeout is and optional parameter to define a custom
+// timeout while waiting for the VPP socket
+func SetSocketRetryTimeout(t time.Duration) Option {
+	return func(c *StatsClient) {
+		c.retryTimeout = t
 	}
+}
 
-	if err := c.statSegment.connect(c.sockAddr); err != nil {
+// NewStatsClient returns a new StatsClient using socket.
+// If socket is empty string DefaultSocketName is used.
+func NewStatsClient(socket string, options ...Option) *StatsClient {
+	if socket == "" {
+		socket = DefaultSocketName
+	}
+	s := &StatsClient{
+		socket: socket,
+	}
+	for _, option := range options {
+		option(s)
+	}
+	if s.retryPeriod == 0 {
+		s.retryPeriod = DefaultSocketRetryPeriod
+	}
+	if s.retryTimeout == 0 {
+		s.retryTimeout = DefaultSocketRetryTimeout
+	}
+	return s
+}
+
+// Connect to validated VPP stats socket and start monitoring
+// socket file changes
+func (sc *StatsClient) Connect() (err error) {
+	if err := sc.waitForSocket(); err != nil {
 		return err
 	}
-
+	sc.done = make(chan struct{})
+	sc.accessLock.Lock()
+	defer sc.accessLock.Unlock()
+	if sc.statSegment, err = sc.connect(); err != nil {
+		return err
+	}
+	sc.monitorSocket()
 	return nil
 }
 
-func (c *StatsClient) Disconnect() error {
-	if err := c.statSegment.disconnect(); err != nil {
-		return err
+// Disconnect from the socket, unmap shared memory and terminate
+// socket monitor
+func (sc *StatsClient) Disconnect() error {
+	if atomic.CompareAndSwapUint32(&sc.monitored, 1, 0) {
+		close(sc.done)
 	}
-	return nil
+
+	if !sc.isConnected() {
+		return nil
+	}
+
+	return sc.disconnect()
 }
 
-func (c *StatsClient) ListStats(patterns ...string) (names []string, err error) {
-	sa := c.accessStart()
-	if sa.epoch == 0 {
+func (sc *StatsClient) ListStats(patterns ...string) (entries []adapter.StatIdentifier, err error) {
+	if !sc.isConnected() {
+		return nil, adapter.ErrStatsDisconnected
+	}
+	sc.accessLock.RLock()
+	defer sc.accessLock.RUnlock()
+	accessEpoch := sc.accessStart()
+	if accessEpoch == 0 {
 		return nil, adapter.ErrStatsAccessFailed
 	}
 
-	indexes, err := c.listIndexes(patterns...)
+	entries, err = sc.getIdentifierEntries(patterns...)
 	if err != nil {
 		return nil, err
 	}
 
-	dirVector := c.getStatDirVector()
-	vecLen := uint32(vectorLen(dirVector))
-
-	for _, index := range indexes {
-		if index >= vecLen {
-			return nil, fmt.Errorf("stat entry index %d out of dir vector len (%d)", index, vecLen)
-		}
-
-		dirEntry := c.getStatDirIndex(dirVector, index)
-		var name []byte
-		for n := 0; n < len(dirEntry.name); n++ {
-			if dirEntry.name[n] == 0 {
-				name = dirEntry.name[:n]
-				break
-			}
-		}
-		names = append(names, string(name))
-	}
-
-	if !c.accessEnd(&sa) {
+	if !sc.accessEnd(accessEpoch) {
 		return nil, adapter.ErrStatsDataBusy
 	}
-
-	return names, nil
-}
-
-func (c *StatsClient) DumpStats(patterns ...string) (entries []adapter.StatEntry, err error) {
-	sa := c.accessStart()
-	if sa.epoch == 0 {
-		return nil, adapter.ErrStatsAccessFailed
-	}
-
-	indexes, err := c.listIndexes(patterns...)
-	if err != nil {
-		return nil, err
-	}
-	if entries, err = c.dumpEntries(indexes); err != nil {
-		return nil, err
-	}
-
-	if !c.accessEnd(&sa) {
-		return nil, adapter.ErrStatsDataBusy
-	}
-
 	return entries, nil
 }
 
-func (c *StatsClient) PrepareDir(patterns ...string) (*adapter.StatDir, error) {
-	dir := new(adapter.StatDir)
+func (sc *StatsClient) DumpStats(patterns ...string) (entries []adapter.StatEntry, err error) {
+	if !sc.isConnected() {
+		return nil, adapter.ErrStatsDisconnected
+	}
 
-	sa := c.accessStart()
-	if sa.epoch == 0 {
+	sc.accessLock.RLock()
+	defer sc.accessLock.RUnlock()
+	accessEpoch := sc.accessStart()
+	if accessEpoch == 0 {
 		return nil, adapter.ErrStatsAccessFailed
 	}
 
-	indexes, err := c.listIndexes(patterns...)
+	entries, err = sc.getStatEntries(patterns...)
 	if err != nil {
 		return nil, err
 	}
-	dir.Indexes = indexes
 
-	entries, err := c.dumpEntries(indexes)
-	if err != nil {
-		return nil, err
-	}
-	dir.Entries = entries
-
-	if !c.accessEnd(&sa) {
+	if !sc.accessEnd(accessEpoch) {
 		return nil, adapter.ErrStatsDataBusy
 	}
-	dir.Epoch = sa.epoch
+	return entries, nil
+}
+
+func (sc *StatsClient) PrepareDir(patterns ...string) (*adapter.StatDir, error) {
+	if !sc.isConnected() {
+		return nil, adapter.ErrStatsDisconnected
+	}
+
+	sc.accessLock.RLock()
+	defer sc.accessLock.RUnlock()
+	accessEpoch := sc.accessStart()
+	if accessEpoch == 0 {
+		return nil, adapter.ErrStatsAccessFailed
+	}
+
+	entries, err := sc.getStatEntries(patterns...)
+	if err != nil {
+		return nil, err
+	}
+
+	if !sc.accessEnd(accessEpoch) {
+		return nil, adapter.ErrStatsDataBusy
+	}
+
+	dir := &adapter.StatDir{
+		Epoch:   accessEpoch,
+		Entries: entries,
+	}
 
 	return dir, nil
 }
 
-func (c *StatsClient) UpdateDir(dir *adapter.StatDir) (err error) {
-	epoch, _ := c.getEpoch()
+func (sc *StatsClient) PrepareDirOnIndex(indexes ...uint32) (*adapter.StatDir, error) {
+	if !sc.isConnected() {
+		return nil, adapter.ErrStatsDisconnected
+	}
+
+	sc.accessLock.RLock()
+	defer sc.accessLock.RUnlock()
+	accessEpoch := sc.accessStart()
+	if accessEpoch == 0 {
+		return nil, adapter.ErrStatsAccessFailed
+	}
+	vector := sc.GetDirectoryVector()
+	if vector == nil {
+		return nil, fmt.Errorf("failed to prepare dir on index: directory vector is nil")
+	}
+	entries, err := sc.getStatEntriesOnIndex(vector, indexes...)
+	if err != nil {
+		return nil, err
+	}
+
+	if !sc.accessEnd(accessEpoch) {
+		return nil, adapter.ErrStatsDataBusy
+	}
+
+	dir := &adapter.StatDir{
+		Epoch:   accessEpoch,
+		Entries: entries,
+	}
+
+	return dir, nil
+}
+
+// UpdateDir refreshes directory data for all counters
+func (sc *StatsClient) UpdateDir(dir *adapter.StatDir) (err error) {
+	if !sc.isConnected() {
+		return adapter.ErrStatsDisconnected
+	}
+
+	sc.accessLock.RLock()
+	defer sc.accessLock.RUnlock()
+	epoch, _ := sc.GetEpoch()
 	if dir.Epoch != epoch {
 		return adapter.ErrStatsDirStale
 	}
 
-	sa := c.accessStart()
-	if sa.epoch == 0 {
+	accessEpoch := sc.accessStart()
+	if accessEpoch == 0 {
 		return adapter.ErrStatsAccessFailed
 	}
-
-	dirVector := c.getStatDirVector()
-
-	for i, index := range dir.Indexes {
-		dirEntry := c.getStatDirIndex(dirVector, index)
-
-		var name []byte
-		for n := 0; n < len(dirEntry.name); n++ {
-			if dirEntry.name[n] == 0 {
-				name = dirEntry.name[:n]
-				break
-			}
-		}
-		if len(name) == 0 {
-			continue
-		}
-
-		entry := &dir.Entries[i]
-		if !bytes.Equal(name, entry.Name) {
-			continue
-		}
-		if adapter.StatType(dirEntry.directoryType) != entry.Type {
-			continue
-		}
-		if entry.Data == nil {
-			continue
-		}
-		if err := c.updateEntryData(dirEntry, &entry.Data); err != nil {
-			return fmt.Errorf("updating stat data for entry %s failed: %v", name, err)
-		}
-
+	dirVector := sc.GetDirectoryVector()
+	if dirVector == nil {
+		return err
 	}
-
-	if !c.accessEnd(&sa) {
+	for i := 0; i < len(dir.Entries); i++ {
+		if err := sc.updateStatOnIndex(&dir.Entries[i], dirVector); err != nil {
+			return err
+		}
+	}
+	if !sc.accessEnd(accessEpoch) {
 		return adapter.ErrStatsDataBusy
 	}
-
 	return nil
 }
 
+// checks the socket existence and waits for it for the designated
+// time if it is not available immediately
+func (sc *StatsClient) waitForSocket() error {
+	if _, err := os.Stat(sc.socket); err != nil {
+		if os.IsNotExist(err) {
+			n := time.Now()
+			ticker := time.NewTicker(sc.retryPeriod)
+			timeout := time.After(sc.retryTimeout)
+			for {
+				select {
+				case <-ticker.C:
+					if _, err := os.Stat(sc.socket); err == nil {
+						return nil
+					}
+				case <-timeout:
+					return fmt.Errorf("stats socket file %s is not ready within timeout (after %.2f s) ",
+						sc.socket, time.Since(n).Seconds())
+				}
+			}
+		} else {
+			return fmt.Errorf("stats socket error: %v", err)
+		}
+	}
+	return nil
+}
+
+// connect to the socket and map it into the memory. According to the
+// header version info, an appropriate segment handler is returned
+func (sc *StatsClient) connect() (ss statSegment, err error) {
+	addr := net.UnixAddr{
+		Net:  "unixpacket",
+		Name: sc.socket,
+	}
+	Log.Debugf("connecting to: %v", addr)
+
+	conn, err := net.DialUnix(addr.Net, nil, &addr)
+	if err != nil {
+		Log.Warnf("connecting to socket %s failed: %s", addr, err)
+		return nil, err
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			Log.Warnf("closing socket failed: %v", err)
+		}
+	}()
+	Log.Debugf("connected to socket")
+
+	files, err := fd.Get(conn, 1, nil)
+	if err != nil {
+		return nil, fmt.Errorf("getting file descriptor over socket failed: %v", err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no files received over socket")
+	}
+
+	file := files[0]
+	defer func() {
+		if err := file.Close(); err != nil {
+			Log.Warnf("closing file failed: %v", err)
+		}
+	}()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+
+	sc.headerData, err = syscall.Mmap(int(file.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		Log.Debugf("mapping shared memory failed: %v", err)
+		return nil, fmt.Errorf("mapping shared memory failed: %v", err)
+	}
+	Log.Debugf("successfully mmapped shared memory segment (size: %v) %v", size, len(sc.headerData))
+
+	version := getVersion(sc.headerData)
+	switch version {
+	case 1:
+		ss = newStatSegmentV1(sc.headerData, size)
+	case 2:
+		ss = newStatSegmentV2(sc.headerData, size)
+	default:
+		if err = syscall.Munmap(sc.headerData); err != nil {
+			Log.Debugf("unmapping shared memory failed: %v", err)
+		}
+		return nil, fmt.Errorf("stat segment version is not supported: %v (min: %v, max: %v)",
+			version, minVersion, maxVersion)
+	}
+
+	// set connected
+	atomic.CompareAndSwapUint32(&sc.connected, 0, 1)
+
+	return ss, nil
+}
+
+// reconnect disconnects from the socket, re-validates it and
+// connects again
+func (sc *StatsClient) reconnect() (err error) {
+	sc.accessLock.Lock()
+	defer sc.accessLock.Unlock()
+	if err = sc.disconnect(); err != nil {
+		return fmt.Errorf("error disconnecting socket: %v", err)
+	}
+	if err = sc.waitForSocket(); err != nil {
+		return fmt.Errorf("error while waiting on socket: %v", err)
+	}
+	if sc.statSegment, err = sc.connect(); err != nil {
+		return fmt.Errorf("error connecting socket: %v", err)
+	}
+	return nil
+}
+
+// disconnect unmaps socket data from the memory and resets the header
+func (sc *StatsClient) disconnect() error {
+
+	if !atomic.CompareAndSwapUint32(&sc.connected, 1, 0) {
+		return fmt.Errorf("stats client is already disconnected")
+	}
+	if sc.headerData == nil {
+		return nil
+	}
+	if err := syscall.Munmap(sc.headerData); err != nil {
+		Log.Debugf("unmapping shared memory failed: %v", err)
+		return fmt.Errorf("unmapping shared memory failed: %v", err)
+	}
+	sc.headerData = nil
+
+	Log.Debugf("successfully unmapped shared memory")
+	return nil
+}
+
+func (sc *StatsClient) monitorSocket() {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		Log.Errorf("error starting socket monitor: %v", err)
+		return
+	}
+
+	atomic.StoreUint32(&sc.monitored, 1)
+
+	go func() {
+		for {
+			select {
+			case event := <-watcher.Events:
+				if event.Op == fsnotify.Remove && event.Name == sc.socket {
+					if err := sc.reconnect(); err != nil {
+						Log.Errorf("error occurred during socket reconnect: %v", err)
+					}
+				}
+			case err := <-watcher.Errors:
+				Log.Errorf("socket monitor delivered error event: %v", err)
+			case <-sc.done:
+				err := watcher.Close()
+				Log.Debugf("socket monitor closed (error: %v)", err)
+				return
+			}
+		}
+	}()
+
+	if err := watcher.Add(filepath.Dir(sc.socket)); err != nil {
+		Log.Errorf("failed to add socket address to the watcher: %v", err)
+	}
+}
+
+// Starts monitoring 'inProgress' field. Returns stats segment
+// access epoch when completed, or zero value if not finished
+// within MaxWaitInProgress
+func (sc *StatsClient) accessStart() (epoch int64) {
+	t := time.Now()
+
+	epoch, inProg := sc.GetEpoch()
+	for inProg {
+		if time.Since(t) > MaxWaitInProgress {
+			return int64(0)
+		}
+		time.Sleep(CheckDelayInProgress)
+		epoch, inProg = sc.GetEpoch()
+	}
+	return epoch
+}
+
+// AccessEnd returns true if stats data reading was finished, false
+// otherwise
+func (sc *StatsClient) accessEnd(accessEpoch int64) bool {
+	epoch, inProgress := sc.GetEpoch()
+	if accessEpoch != epoch || inProgress {
+		return false
+	}
+	return true
+}
+
+// getStatEntries retrieves all stats matching desired patterns, or all stats if no pattern is provided.
+func (sc *StatsClient) getStatEntries(patterns ...string) (entries []adapter.StatEntry, err error) {
+	vector := sc.GetDirectoryVector()
+	if vector == nil {
+		return nil, fmt.Errorf("failed to get stat entries: directory vector is nil")
+	}
+	indexes, err := sc.listIndexes(vector, patterns...)
+	if err != nil {
+		return nil, err
+	}
+	return sc.getStatEntriesOnIndex(vector, indexes...)
+}
+
+// getIdentifierEntries retrieves all identifiers matching desired patterns, or all identifiers
+// if no pattern is provided.
+func (sc *StatsClient) getIdentifierEntries(patterns ...string) (identifiers []adapter.StatIdentifier, err error) {
+	vector := sc.GetDirectoryVector()
+	if vector == nil {
+		return nil, fmt.Errorf("failed to get identifier entries: directory vector is nil")
+	}
+	indexes, err := sc.listIndexes(vector, patterns...)
+	if err != nil {
+		return nil, err
+	}
+	return sc.getIdentifierEntriesOnIndex(vector, indexes...)
+}
+
+// getStatEntriesOnIndex retrieves stats on indexes, or all stats if indexes are not defined.
+func (sc *StatsClient) getStatEntriesOnIndex(vector dirVector, indexes ...uint32) (entries []adapter.StatEntry, err error) {
+	dirLen := *(*uint32)(vectorLen(vector))
+	for _, index := range indexes {
+		if index >= dirLen {
+			return nil, fmt.Errorf("stat entry index %d out of dir vector length (%d)", index, dirLen)
+		}
+		dirPtr, dirName, dirType := sc.GetStatDirOnIndex(vector, index)
+		if len(dirName) == 0 {
+			return
+		}
+		var t adapter.StatType
+		d := sc.CopyEntryData(dirPtr, ^uint32(0))
+		if d != nil {
+			t = d.Type()
+		}
+		entries = append(entries, adapter.StatEntry{
+			StatIdentifier: adapter.StatIdentifier{
+				Index: index,
+				Name:  dirName,
+			},
+			Type:    t,
+			Data:    d,
+			Symlink: dirType == adapter.Symlink,
+		})
+	}
+	return entries, nil
+}
+
+// getIdentifierEntriesOnIndex retrieves identifiers on indexes, or all identifiers if indexes are not defined.
+func (sc *StatsClient) getIdentifierEntriesOnIndex(vector dirVector, indexes ...uint32) (identifiers []adapter.StatIdentifier, err error) {
+	dirLen := *(*uint32)(vectorLen(vector))
+	for _, index := range indexes {
+		if index >= dirLen {
+			return nil, fmt.Errorf("stat entry index %d out of dir vector length (%d)", index, dirLen)
+		}
+		_, dirName, _ := sc.GetStatDirOnIndex(vector, index)
+		if len(dirName) == 0 {
+			return
+		}
+		identifiers = append(identifiers, adapter.StatIdentifier{
+			Index: index,
+			Name:  dirName,
+		})
+	}
+	return identifiers, nil
+}
+
 // listIndexes lists indexes for all stat entries that match any of the regex patterns.
-func (c *StatsClient) listIndexes(patterns ...string) (indexes []uint32, err error) {
+func (sc *StatsClient) listIndexes(vector dirVector, patterns ...string) (indexes []uint32, err error) {
 	if len(patterns) == 0 {
-		return c.listIndexesFunc(nil)
+		return sc.listIndexesFunc(vector, nil)
 	}
 	var regexes = make([]*regexp.Regexp, len(patterns))
 	for i, pattern := range patterns {
@@ -260,7 +581,7 @@ func (c *StatsClient) listIndexes(patterns ...string) (indexes []uint32, err err
 		}
 		regexes[i] = r
 	}
-	nameMatches := func(name []byte) bool {
+	nameMatches := func(name dirName) bool {
 		for _, r := range regexes {
 			if r.Match(name) {
 				return true
@@ -268,31 +589,22 @@ func (c *StatsClient) listIndexes(patterns ...string) (indexes []uint32, err err
 		}
 		return false
 	}
-	return c.listIndexesFunc(nameMatches)
+	return sc.listIndexesFunc(vector, nameMatches)
 }
 
-func (c *StatsClient) listIndexesFunc(f func(name []byte) bool) (indexes []uint32, err error) {
+// listIndexesFunc lists stats indexes. The optional function
+// argument filters returned values or returns all if empty
+func (sc *StatsClient) listIndexesFunc(vector dirVector, f func(name dirName) bool) (indexes []uint32, err error) {
 	if f == nil {
 		// there is around ~3157 stats, so to avoid too many allocations
 		// we set capacity to 3200 when listing all stats
 		indexes = make([]uint32, 0, 3200)
 	}
-
-	dirVector := c.getStatDirVector()
-	vecLen := uint32(vectorLen(dirVector))
-
+	vecLen := *(*uint32)(vectorLen(vector))
 	for i := uint32(0); i < vecLen; i++ {
-		dirEntry := c.getStatDirIndex(dirVector, i)
-
+		_, dirName, _ := sc.GetStatDirOnIndex(vector, i)
 		if f != nil {
-			var name []byte
-			for n := 0; n < len(dirEntry.name); n++ {
-				if dirEntry.name[n] == 0 {
-					name = dirEntry.name[:n]
-					break
-				}
-			}
-			if len(name) == 0 || !f(name) {
+			if len(dirName) == 0 || !f(dirName) {
 				continue
 			}
 		}
@@ -302,44 +614,25 @@ func (c *StatsClient) listIndexesFunc(f func(name []byte) bool) (indexes []uint3
 	return indexes, nil
 }
 
-func (c *StatsClient) dumpEntries(indexes []uint32) (entries []adapter.StatEntry, err error) {
-	dirVector := c.getStatDirVector()
-	dirLen := uint32(vectorLen(dirVector))
+func (sc *StatsClient) isConnected() bool {
+	return atomic.LoadUint32(&sc.connected) == 1
+}
 
-	debugf("dumping entres for %d indexes", len(indexes))
-
-	entries = make([]adapter.StatEntry, 0, len(indexes))
-	for _, index := range indexes {
-		if index >= dirLen {
-			return nil, fmt.Errorf("stat entry index %d out of dir vector length (%d)", index, dirLen)
-		}
-
-		dirEntry := c.getStatDirIndex(dirVector, index)
-
-		var name []byte
-		for n := 0; n < len(dirEntry.name); n++ {
-			if dirEntry.name[n] == 0 {
-				name = dirEntry.name[:n]
-				break
-			}
-		}
-
-		if Debug {
-			debugf(" - %3d. dir: %q type: %v offset: %d union: %d", index, name,
-				adapter.StatType(dirEntry.directoryType), dirEntry.offsetVector, dirEntry.unionData)
-		}
-
-		if len(name) == 0 {
-			continue
-		}
-
-		entry := adapter.StatEntry{
-			Name: append([]byte(nil), name...),
-			Type: adapter.StatType(dirEntry.directoryType),
-			Data: c.copyEntryData(dirEntry),
-		}
-		entries = append(entries, entry)
+// updateStatOnIndex refreshes the entry data.
+func (sc *StatsClient) updateStatOnIndex(entry *adapter.StatEntry, vector dirVector) (err error) {
+	dirLen := *(*uint32)(vectorLen(vector))
+	if entry.Index >= dirLen {
+		return fmt.Errorf("stat entry index %d out of dir vector length (%d)", entry.Index, dirLen)
 	}
-
-	return entries, nil
+	dirPtr, dirName, dirType := sc.GetStatDirOnIndex(vector, entry.Index)
+	if len(dirName) == 0 ||
+		!bytes.Equal(dirName, entry.Name) ||
+		dirType != entry.Type ||
+		entry.Data == nil {
+		return nil
+	}
+	if err := sc.UpdateEntryData(dirPtr, &entry.Data); err != nil {
+		return fmt.Errorf("updating stat data for entry %s failed: %v", dirName, err)
+	}
+	return
 }
