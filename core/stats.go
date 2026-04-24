@@ -239,11 +239,12 @@ func (c *StatsConnection) GetErrorStats(errorStats *api.ErrorStats) (err error) 
 	}
 
 	for i, stat := range c.errorStatsData.Entries {
-		if stat.Type != adapter.ErrorIndex {
-			continue
-		}
 		if errStat, ok := stat.Data.(adapter.ErrorStat); ok {
-			errorStats.Errors[i].Value = uint64(errStat)
+			values := make([]uint64, len(errStat))
+			for j, v := range errStat {
+				values[j] = uint64(v)
+			}
+			errorStats.Errors[i].Values = values
 		}
 	}
 
