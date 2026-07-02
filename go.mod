@@ -1,10 +1,10 @@
 module go.fd.io/govpp
 
-go 1.18
+go 1.25.0
 
 require (
 	github.com/bennyscetbun/jsongo v1.1.1
-	github.com/docker/cli v27.0.3+incompatible
+	github.com/docker/cli v29.2.0+incompatible
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/ftrvxmtrx/fd v0.0.0-20150925145434-c6d800382fff
 	github.com/gookit/color v1.5.4
@@ -14,10 +14,10 @@ require (
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/onsi/gomega v1.33.1
 	github.com/pkg/profile v1.7.0
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/pflag v1.0.5
-	golang.org/x/text v0.16.0
+	golang.org/x/text v0.37.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -30,8 +30,8 @@ require (
 	github.com/kr/pretty v0.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/xo/terminfo v0.0.0-20210125001918-ca9a967f8778 // indirect
-	golang.org/x/net v0.24.0 // indirect
-	golang.org/x/sys v0.19.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
 )
 
