@@ -200,6 +200,9 @@ func (s NameStat) IsZero() bool {
 func ReduceSimpleCounterStatIndex(s SimpleCounterStat, i int) uint64 {
 	var val uint64
 	for _, w := range s {
+		if i >= len(w) {
+			continue
+		}
 		val += uint64(w[i])
 	}
 	return val
@@ -209,6 +212,9 @@ func ReduceSimpleCounterStatIndex(s SimpleCounterStat, i int) uint64 {
 func ReduceCombinedCounterStatIndex(s CombinedCounterStat, i int) [2]uint64 {
 	var val [2]uint64
 	for _, w := range s {
+		if i >= len(w) {
+			continue
+		}
 		val[0] += uint64(w[i][0])
 		val[1] += uint64(w[i][1])
 	}
