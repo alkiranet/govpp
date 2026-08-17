@@ -203,6 +203,9 @@ func (c *StatsConnection) GetSystemStats(sysStats *api.SystemStats) (err error) 
 			if ss, ok := stat.Data.(adapter.SimpleCounterStat); ok {
 				vals = make([]uint64, len(ss))
 				for w := range ss {
+					if len(ss[w]) == 0 {
+						continue
+					}
 					vals[w] = uint64(ss[w][0])
 				}
 			}
@@ -265,6 +268,9 @@ func (c *StatsConnection) GetNodeStats(nodeStats *api.NodeStats) (err error) {
 	}
 	perNode := func(stat adapter.StatEntry, fn func(*api.NodeCounters, uint64)) {
 		if s, ok := stat.Data.(adapter.SimpleCounterStat); ok {
+			if len(s) == 0 {
+				return
+			}
 			prepNodes(len(s[0]))
 			for i := range nodeStats.Nodes {
 				val := adapter.ReduceSimpleCounterStatIndex(s, i)
@@ -323,6 +329,9 @@ func (c *StatsConnection) GetInterfaceStats(ifaceStats *api.InterfaceStats) (err
 	}
 	perNode := func(stat adapter.StatEntry, fn func(*api.InterfaceCounters, uint64)) {
 		if s, ok := stat.Data.(adapter.SimpleCounterStat); ok {
+			if len(s) == 0 {
+				return
+			}
 			prep(len(s[0]))
 			for i := range ifaceStats.Interfaces {
 				val := adapter.ReduceSimpleCounterStatIndex(s, i)
@@ -332,6 +341,9 @@ func (c *StatsConnection) GetInterfaceStats(ifaceStats *api.InterfaceStats) (err
 	}
 	perNodeComb := func(stat adapter.StatEntry, fn func(*api.InterfaceCounters, [2]uint64)) {
 		if s, ok := stat.Data.(adapter.CombinedCounterStat); ok {
+			if len(s) == 0 {
+				return
+			}
 			prep(len(s[0]))
 			for i := range ifaceStats.Interfaces {
 				val := adapter.ReduceCombinedCounterStatIndex(s, i)
